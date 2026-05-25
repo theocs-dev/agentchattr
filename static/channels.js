@@ -318,6 +318,7 @@ function filterMessagesByChannel() {
         const ch = el.dataset.channel || 'general';
         el.style.display = ch === window.activeChannel ? '' : 'none';
     }
+    if (window.updateTokenMeters) window.updateTokenMeters();
 }
 
 // ---------------------------------------------------------------------------

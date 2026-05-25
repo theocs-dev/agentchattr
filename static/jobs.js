@@ -36,6 +36,7 @@ let _draggedJobStatus = null;
 let _pendingJobReflowTops = null;
 let _pendingJobReflowTimer = null;
 const _expandedGroups = new Set(['open']); // track which collapsible groups are open across re-renders
+const JOB_MENTION_NAME_SOURCE = String.raw`[\p{L}\p{N}_][\p{L}\p{N}\p{M}_-]*`;
 
 // ---------------------------------------------------------------------------
 // Message Renderers
@@ -251,7 +252,7 @@ function _extractJobMentionTargets(text) {
     const byLower = {};
     for (const o of opts) byLower[o.name.toLowerCase()] = o.name;
     const hits = [];
-    const re = /@([a-zA-Z][\w-]*)/g;
+    const re = new RegExp(`@(${JOB_MENTION_NAME_SOURCE})`, 'gu');
     let m;
     while ((m = re.exec(text)) !== null) {
         const key = m[1].toLowerCase();

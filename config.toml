@@ -13,11 +13,59 @@ cwd = "/Users/theocs/IPCRA"
 color = "#da7756"
 label = "Claude"
 
+[agents.claude.profiles.xhigh]
+label = "Opus 4.7 XHigh"
+model = "opus"
+reasoning = "xhigh"
+context_limit = 1000000
+args = ["--permission-mode", "auto"]
+default = true
+
+[agents.claude.profiles.high]
+label = "Opus 4.7 High"
+model = "opus"
+reasoning = "high"
+context_limit = 1000000
+args = ["--permission-mode", "auto"]
+
+[agents.claude.profiles.low]
+label = "Opus 4.7 Low"
+model = "opus"
+reasoning = "low"
+context_limit = 1000000
+args = ["--permission-mode", "auto"]
+
+[agents.claude.profiles.sonnet]
+label = "Sonnet"
+model = "sonnet"
+reasoning = "high"
+context_limit = 200000
+args = ["--permission-mode", "auto"]
+
 [agents.codex]
 command = "codex"
 cwd = "/Users/theocs/IPCRA"
 color = "#10a37f"
 label = "Codex"
+
+[agents.codex.profiles.balanced]
+label = "Balanced"
+model = "gpt-5.5"
+reasoning = "high"
+context_limit = 258000
+default = true
+
+[agents.codex.profiles.fast]
+label = "Fast"
+model = "gpt-5.5"
+reasoning = "medium"
+context_limit = 258000
+
+[agents.codex.profiles.deep]
+label = "Deep"
+model = "gpt-5.5"
+reasoning = "xhigh"
+context_limit = 258000
 
 [agents.gemini]
 command = "gemini"

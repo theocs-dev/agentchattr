@@ -26,6 +26,14 @@ let agentHats = {};  // { agent_name: svg_string }
 window.customRoles = [];  // saved custom roles from settings
 let colorOverrides = JSON.parse(localStorage.getItem('agentchattr-color-overrides') || '{}');
 let schedulesList = [];  // array of schedule objects from server
+let selectedAgentProfiles = {};  // { base: profile_name }
+const MENTION_NAME_SOURCE = String.raw`[\p{L}\p{N}_][\p{L}\p{N}\p{M}_-]*`;
+function mentionRegex(flags = 'gu') {
+    return new RegExp(`@(${MENTION_NAME_SOURCE})`, flags);
+}
+function bareMentionRegex(flags = 'gu') {
+    return new RegExp(`@${MENTION_NAME_SOURCE}`, flags);
+}
 
 // Expose globals that extracted modules (sessions.js, jobs.js) read via window.*
 // Using defineProperty so live values are always returned.
@@ -747,7 +755,7 @@ function appendMessage(msg) {
 
         // Update last mentioned agent if message is from user (Ben)
         if (msg.sender.toLowerCase() === username.toLowerCase()) {
-            const mentions = msg.text.match(/@(\w[\w-]*)/g);
+            const mentions = msg.text.match(mentionRegex());
             if (mentions) {
                 const lastMention = mentions[mentions.length - 1].slice(1).toLowerCase();
                 // Check against registered agents (agentConfig keys are name labels)
@@ -833,6 +841,7 @@ function appendMessage(msg) {
     }
 
     container.appendChild(el);
+    updateTokenMeters();
 
     // Collapse consecutive job_created messages into a group
     if (msg.type === 'job_created' && window._collapseJobBreadcrumbs) {
@@ -888,7 +897,7 @@ function getColor(sender) {
 
 function colorMentions(textHtml) {
     // Match any @word — we'll resolve color per match
-    return textHtml.replace(/@(\w[\w-]*)/gi, (match, name) => {
+    return textHtml.replace(mentionRegex(), (match, name) => {
         const lower = name.toLowerCase();
         if (lower === 'both' || lower === 'all') {
             return `<span class="mention" style="color: var(--accent)">@${name}</span>`;
@@ -947,13 +956,18 @@ function applyAgentConfig(data) {
     agentConfig = {};
     for (const [name, cfg] of Object.entries(data)) {
         agentConfig[name.toLowerCase()] = cfg;
+        if (cfg.base && cfg.profile?.selected) {
+            selectedAgentProfiles[cfg.base] = cfg.profile.selected;
+        }
     }
     buildStatusPills();
+    buildAgentProfileSettings();
     buildMentionToggles();
     buildSoundSettings();
     // Re-color any messages already rendered (e.g. from a reconnect)
     recolorMessages();
     updateJobReplyTargetUI();
+    updateTokenMeters();
 }
 
 function recolorMessages() {
@@ -1140,7 +1154,16 @@ function buildStatusPills() {
         pill.id = `status-${name}`;
         pill.title = `@${name}`;  // Tooltip: canonical name for manual @-typing
         pill.style.setProperty('--agent-color', colorOverrides[name] || cfg.color || '#4ade80');
-        pill.innerHTML = `<span class="status-dot"></span><span class="status-label">${escapeHtml(cfg.label || name)}</span>`;
+        const profile = getSelectedProfile(cfg);
+        const profileLabel = profile?.label || cfg.profile?.selected || '';
+        pill.innerHTML = `
+            <span class="status-dot"></span>
+            <span class="status-body">
+                <span class="status-label">${escapeHtml(cfg.label || name)}</span>
+                <span class="status-meta">${escapeHtml(profileLabel)}</span>
+                <span class="token-meter"><span class="token-meter-fill"></span></span>
+                <span class="token-meter-label"></span>
+            </span>`;
         // Left-click to toggle pill popover (rename + role + color)
         pill.addEventListener('click', (e) => {
             e.stopPropagation();
@@ -1156,7 +1179,80 @@ function buildStatusPills() {
         container.appendChild(pill);
     }
     enableDragScroll(container);
+    updateTokenMeters();
 }
+
+function getSelectedProfile(cfg) {
+    const selected = cfg?.profile?.selected;
+    const profiles = cfg?.profile?.profiles || {};
+    return selected ? profiles[selected] : null;
+}
+
+function buildAgentProfileSettings() {
+    const bases = ['claude', 'codex'];
+    for (const base of bases) {
+        const field = document.getElementById(`agent-profile-${base}-field`);
+        const select = document.getElementById(`setting-profile-${base}`);
+        if (!field || !select) continue;
+
+        const instanceCfg = Object.values(agentConfig).find(cfg => cfg.base === base);
+        const profiles = instanceCfg?.profile?.profiles || {};
+        const selected = instanceCfg?.profile?.selected || selectedAgentProfiles[base] || '';
+        select.innerHTML = '';
+        const names = Object.keys(profiles);
+        if (names.length === 0) {
+            field.classList.add('hidden');
+            continue;
+        }
+        for (const name of names) {
+            const profile = profiles[name] || {};
+            const opt = document.createElement('option');
+            opt.value = name;
+            const label = profile.label || name;
+            const model = profile.model ? ` · ${profile.model}` : '';
+            const reasoning = profile.reasoning ? ` · ${profile.reasoning}` : '';
+            opt.textContent = `${label}${model}${reasoning}`;
+            if (name === selected) opt.selected = true;
+            select.appendChild(opt);
+        }
+        field.classList.remove('hidden');
+    }
+}
+
+function formatTokenCount(n) {
+    if (!Number.isFinite(n) || n <= 0) return '0';
+    if (n >= 1000000) return (n / 1000000).toFixed(n >= 10000000 ? 0 : 1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(n >= 100000 ? 0 : 1) + 'k';
+    return String(n);
+}
+
+function updateTokenMeters() {
+    for (const [name, cfg] of Object.entries(agentConfig)) {
+        const pill = document.getElementById(`status-${name}`);
+        if (!pill) continue;
+        const profile = getSelectedProfile(cfg);
+        const limit = Number(profile?.context_limit || 0);
+        const usage = cfg.usage || null;
+        const ok = usage && usage.status === 'ok' && Number.isFinite(Number(usage.used_tokens));
+        const used = ok ? Number(usage.used_tokens) : 0;
+        const pct = limit && ok ? Math.min(100, used / limit * 100) : 0;
+        const fill = pill.querySelector('.token-meter-fill');
+        const label = pill.querySelector('.token-meter-label');
+        if (fill) fill.style.width = `${pct}%`;
+        if (label) {
+            label.textContent = ok && limit
+                ? `${formatTokenCount(used)} / ${formatTokenCount(limit)}`
+                : 'usage unavailable';
+        }
+        const model = profile?.model || 'default model';
+        const reasoning = profile?.reasoning || 'default reasoning';
+        const usageText = ok && limit
+            ? `${formatTokenCount(used)} / ${formatTokenCount(limit)}`
+            : 'usage unavailable';
+        pill.title = `@${name} · ${model} · ${reasoning} · ${usageText}`;
+    }
+}
+window.updateTokenMeters = updateTokenMeters;
 
 // --- Role presets (shared by pill popover + bubble picker) ---
 
@@ -1711,7 +1807,12 @@ function updateStatus(data) {
             _agentRoles[name] = info.role;
             _syncBubbleRolePills(name);
         }
+
+        if (agentConfig[name]) {
+            agentConfig[name].usage = info.usage || null;
+        }
     }
+    updateTokenMeters();
 }
 
 function updateTyping(agent, active) {
@@ -1759,6 +1860,10 @@ function applySettings(data) {
     }
     if (Array.isArray(data.custom_roles)) {
         window.customRoles = data.custom_roles;
+    }
+    if (data.agent_profiles && typeof data.agent_profiles === 'object') {
+        selectedAgentProfiles = data.agent_profiles;
+        buildAgentProfileSettings();
     }
     if (data.channels && Array.isArray(data.channels)) {
         channelList = data.channels;
@@ -1863,6 +1968,11 @@ function saveSettings() {
     const newHistory = histVal === 'all' ? 'all' : (parseInt(histVal) || 50);
     const newContrast = document.getElementById('setting-contrast').value;
     const newRulesRefresh = document.getElementById('setting-rules-refresh').value;
+    const agentProfiles = {};
+    for (const base of ['claude', 'codex']) {
+        const select = document.getElementById(`setting-profile-${base}`);
+        if (select && select.value) agentProfiles[base] = select.value;
+    }
 
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
@@ -1874,6 +1984,7 @@ function saveSettings() {
                 history_limit: newHistory,
                 contrast: newContrast,
                 rules_refresh_interval: parseInt(newRulesRefresh) || 0,
+                agent_profiles: agentProfiles,
             }
         }));
     }
@@ -1896,8 +2007,9 @@ function setupSettingsKeys() {
     }
 
     // Auto-save on change for selects, escape to close
-    for (const id of ['setting-font', 'setting-history', 'setting-contrast', 'setting-rules-refresh']) {
+    for (const id of ['setting-font', 'setting-history', 'setting-contrast', 'setting-rules-refresh', 'setting-profile-claude', 'setting-profile-codex']) {
         const el = document.getElementById(id);
+        if (!el) continue;
         el.addEventListener('change', () => {
             // Apply contrast immediately (don't wait for server round-trip)
             if (id === 'setting-contrast') {
@@ -2045,6 +2157,7 @@ const SLASH_COMMANDS = [
     { cmd: '/poetry sonnet', desc: 'Agents write a sonnet about the codebase', broadcast: true },
     { cmd: '/summary', desc: 'Summarize recent messages — tag an agent (e.g. /summary @claude)', broadcast: false, needsMention: true },
     { cmd: '/summarise', desc: 'Summarize recent messages — tag an agent (e.g. /summarise @claude)', broadcast: false, needsMention: true, hidden: true },
+    { cmd: '/model', desc: 'List or set launch profile (e.g. /model codex fast)', broadcast: false },
     { cmd: '/continue', desc: 'Resume after loop guard pauses', broadcast: false },
     { cmd: '/clear', desc: 'Clear messages in current channel', broadcast: false },
 ];
@@ -2317,7 +2430,7 @@ function sendMessage() {
             skipMentions = true;
         }
         // Commands that need an @mention — show hint and keep command in input
-        if (matchedCmd && matchedCmd.needsMention && !/@\w[\w-]*/.test(text)) {
+        if (matchedCmd && matchedCmd.needsMention && !bareMentionRegex().test(text)) {
             const canonical = matchedCmd.cmd.split(/\s/)[0];  // e.g. '/summary'
             input.value = canonical + ' @';
             input.focus();
@@ -3511,7 +3624,7 @@ function updateSchedulePopoverState() {
     const submitBtn = pop.querySelector('.sched-pop-submit');
     const input = document.getElementById('input');
     const text = input ? input.value.trim() : '';
-    const mentionMatches = text.match(/@(\w[\w-]*)/g) || [];
+    const mentionMatches = text.match(mentionRegex()) || [];
     const targets = new Set(mentionMatches.map(m => m.slice(1)));
     for (const name of activeMentions) targets.add(name);
     if (targets.size === 0) {
@@ -3528,10 +3641,10 @@ async function submitSchedulePopover() {
     const text = input ? input.value.trim() : '';
 
     // Gather targets
-    const mentionMatches = text.match(/@(\w[\w-]*)/g) || [];
+    const mentionMatches = text.match(mentionRegex()) || [];
     const targets = new Set(mentionMatches.map(m => m.slice(1)));
     for (const name of activeMentions) targets.add(name);
-    let prompt = text.replace(/@\w[\w-]*/g, '').trim();
+    let prompt = text.replace(bareMentionRegex(), '').trim();
 
     const errEl = document.getElementById('sched-pop-error');
 
