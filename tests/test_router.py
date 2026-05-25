@@ -38,6 +38,29 @@ class RouterMentionTests(unittest.TestCase):
         self.assertEqual(router.parse_mentions("@telegram-bot check"), [])
         self.assertEqual(router.get_targets("ben", "@telegram-bot check"), [])
 
+    def test_mentions_inside_markdown_code_do_not_route(self):
+        router = Router(["claude", "codex"], default_mention="none")
+
+        self.assertEqual(router.parse_mentions("example: `@codex check this`"), [])
+        self.assertEqual(router.parse_mentions("```text\n@claude check this\n```"), [])
+        self.assertEqual(router.get_targets("ben", "example: `@codex check this`"), [])
+
+    def test_agent_message_only_routes_leading_mentions(self):
+        router = Router(["claude", "codex"], default_mention="none")
+
+        self.assertEqual(router.get_targets("claude", "Example: @codex check this"), [])
+        self.assertEqual(router.get_targets("claude", "Please ask @codex to check"), [])
+        self.assertEqual(router.get_targets("claude", "@codex check this"), ["codex"])
+        self.assertEqual(router.get_targets("claude", "@codex, check this"), ["codex"])
+
+    def test_agent_message_routes_leading_mentions_on_new_lines(self):
+        router = Router(["claude", "codex"], default_mention="none")
+
+        self.assertEqual(
+            router.get_targets("claude", "I am done.\n@codex please review"),
+            ["codex"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

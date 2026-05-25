@@ -9,13 +9,13 @@ data_dir = "./data"
 
 [agents.claude]
 command = "claude"
-cwd = ".."
+cwd = "/Users/theocs/IPCRA"
 color = "#da7756"
 label = "Claude"
 
 [agents.codex]
 command = "codex"
-cwd = ".."
+cwd = "/Users/theocs/IPCRA"
 color = "#10a37f"
 label = "Codex"
 
