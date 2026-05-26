@@ -288,13 +288,10 @@ def chat_send(
             if job:
                 job_channel = job.get("channel", "general")
                 raw_targets = router.get_targets(sender, text, job_channel)
-                targets = []
-                for t in raw_targets:
-                    if registry:
-                        targets.extend(registry.resolve_to_instances(t))
-                    else:
-                        targets.append(t)
-                targets = list(dict.fromkeys(targets))
+                import app as app_module
+                targets = app_module.resolve_targets_for_channel(
+                    raw_targets, job_channel, sender,
+                )
                 chat_msg = f"{sender}: {text}" if text else ""
                 for target in targets:
                     if registry:
@@ -960,4 +957,3 @@ def run_http_server():
 def run_sse_server():
     """Block — run SSE MCP in a background thread."""
     mcp_sse.run(transport="sse")
-

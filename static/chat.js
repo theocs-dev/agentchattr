@@ -35,6 +35,16 @@ function bareMentionRegex(flags = 'gu') {
     return new RegExp(`@${MENTION_NAME_SOURCE}`, flags);
 }
 
+function isLocalAliasChannel(channel) {
+    const ch = String(channel || '').trim().toLowerCase();
+    return ch.length > 0 && !/^\d+$/.test(ch);
+}
+
+function localAliasName(base, channel) {
+    if (!isLocalAliasChannel(channel)) return '';
+    return `${base}-${String(channel || '').trim().toLowerCase()}`;
+}
+
 // Expose globals that extracted modules (sessions.js, jobs.js) read via window.*
 // Using defineProperty so live values are always returned.
 Object.defineProperty(window, 'SESSION_TOKEN', { get() { return SESSION_TOKEN; } });
@@ -1156,11 +1166,12 @@ function buildStatusPills() {
         pill.style.setProperty('--agent-color', colorOverrides[name] || cfg.color || '#4ade80');
         const profile = getSelectedProfile(cfg);
         const profileLabel = profile?.label || cfg.profile?.selected || '';
+        const meta = [cfg.label || name, profileLabel].filter(Boolean).join(' · ');
         pill.innerHTML = `
             <span class="status-dot"></span>
             <span class="status-body">
-                <span class="status-label">${escapeHtml(cfg.label || name)}</span>
-                <span class="status-meta">${escapeHtml(profileLabel)}</span>
+                <span class="status-label">${escapeHtml('@' + name)}</span>
+                <span class="status-meta">${escapeHtml(meta)}</span>
                 <span class="token-meter"><span class="token-meter-fill"></span></span>
                 <span class="token-meter-label"></span>
             </span>`;
@@ -2217,14 +2228,38 @@ function selectSlashCommand(cmd) {
 
 // --- Mention autocomplete ---
 
-function getMentionCandidates() {
+function getMentionCandidates(channel = activeChannel) {
     // Build list: registered agents + "all agents" + username (self) + known humans
     const candidates = [];
+    const effectiveChannel = String(channel || activeChannel || 'general').trim().toLowerCase();
     for (const [name, cfg] of Object.entries(agentConfig)) {
         if (cfg.state === 'pending') continue;
-        candidates.push({ name, label: cfg.label || name, color: cfg.color });
+        candidates.push({
+            name,
+            label: cfg.label || name,
+            handle: `@${name}`,
+            color: cfg.color,
+        });
     }
-    candidates.push({ name: 'all agents', label: 'all agents', color: 'var(--accent)' });
+    const bases = new Set(
+        Object.values(agentConfig)
+            .map(cfg => cfg.base)
+            .filter(Boolean)
+    );
+    for (const base of bases) {
+        const alias = localAliasName(base, effectiveChannel);
+        if (!alias || !(alias in agentConfig) || agentConfig[alias].state === 'pending') continue;
+        const cfg = agentConfig[alias];
+        const familyLabel = baseColors[base]?.label || base;
+        candidates.push({
+            name: base,
+            label: `${familyLabel} in #${effectiveChannel}`,
+            handle: `@${base} -> @${alias}`,
+            color: cfg.color,
+            aliasTarget: alias,
+        });
+    }
+    candidates.push({ name: 'all', label: 'all agents', handle: '@all', color: 'var(--accent)' });
     return candidates;
 }
 
@@ -2263,7 +2298,10 @@ function updateMentionMenu() {
 
     const candidates = getMentionCandidates();
     const matches = candidates.filter(c =>
-        c.name.toLowerCase().includes(query) || c.label.toLowerCase().includes(query)
+        c.name.toLowerCase().includes(query)
+        || c.label.toLowerCase().includes(query)
+        || (c.handle || '').toLowerCase().includes(query)
+        || (c.aliasTarget || '').toLowerCase().includes(query)
     );
 
     if (matches.length === 0) {
@@ -2279,7 +2317,7 @@ function updateMentionMenu() {
         const row = document.createElement('div');
         row.className = 'mention-item' + (i === mentionMenuIndex ? ' active' : '');
         row.dataset.name = item.name;
-        row.innerHTML = `<span class="mention-dot" style="background: ${item.color}"></span><span class="mention-name">${escapeHtml(item.label)}</span>`;
+        row.innerHTML = `<span class="mention-dot" style="background: ${item.color}"></span><span class="mention-name"><span>${escapeHtml(item.label)}</span><span class="mention-handle">&middot; ${escapeHtml(item.handle || '@' + item.name)}</span></span>`;
         row.addEventListener('mousedown', (e) => {
             e.preventDefault();
             selectMention(item.name);
@@ -3036,8 +3074,8 @@ function buildMentionToggles() {
         const btn = document.createElement('button');
         btn.className = 'mention-toggle';
         btn.dataset.agent = name;
-        btn.textContent = `@${cfg.label || name}`;
-        btn.title = `@${name}`;  // Tooltip: canonical name
+        btn.textContent = `@${name}`;
+        btn.title = cfg.label ? `${cfg.label} · @${name}` : `@${name}`;
         btn.style.setProperty('--agent-color', colorOverrides[name] || cfg.color);
         // Restore active state for mentions that survived the rebuild
         if (activeMentions.has(name)) {

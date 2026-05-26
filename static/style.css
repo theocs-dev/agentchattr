@@ -266,6 +266,7 @@ header h1 {
 
 .status-label {
     line-height: 1.15;
+    font-weight: 650;
 }
 
 .status-meta,
@@ -3879,9 +3880,18 @@ footer {
 }
 
 .mention-name {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+    align-items: baseline;
     font-weight: 600;
     font-size: 13px;
     color: var(--text);
+}
+
+.mention-handle {
+    color: var(--text-dim);
+    font-weight: 500;
 }
 
 /* --- Dropzone --- */

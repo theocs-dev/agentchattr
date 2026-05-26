@@ -7,6 +7,7 @@ import sys
 import threading
 import uuid
 import logging
+import time as _time
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
@@ -43,6 +44,8 @@ session_engine: SessionEngine | None = None
 config: dict = {}
 ws_clients: set[WebSocket] = set()
 usage_snapshots: dict[str, dict] = {}
+_target_resolution_warning_times: dict[tuple, float] = {}
+_TARGET_RESOLUTION_WARNING_TTL = 30
 
 # --- Security: session token (set by configure()) ---
 session_token: str = ""
@@ -212,6 +215,91 @@ def _agent_config_for_client() -> dict:
         if base:
             info["profile"] = _profile_payload_for(base)
     return agent_cfg
+
+
+def _is_local_alias_channel(channel: str) -> bool:
+    channel = (channel or "").strip().lower()
+    return bool(channel) and not channel.isdigit()
+
+
+def _local_alias_name(base: str, channel: str) -> str | None:
+    if not _is_local_alias_channel(channel):
+        return None
+    return f"{base}-{channel.strip().lower()}"
+
+
+def _emit_target_resolution_warning(base: str, channel: str, active_names: list[str]):
+    if not store:
+        return
+    key = (channel or "general", base, tuple(active_names))
+    now = _time.time()
+    last = _target_resolution_warning_times.get(key, 0)
+    if now - last < _TARGET_RESOLUTION_WARNING_TTL:
+        return
+    _target_resolution_warning_times[key] = now
+
+    channel_label = f"#{channel or 'general'}"
+    active_text = ", ".join(f"@{name}" for name in active_names)
+    if _is_local_alias_channel(channel):
+        expected = f"@{base}-{channel.strip().lower()}"
+        detail = f"Rename one active instance to {expected} or mention a canonical handle."
+    else:
+        detail = "Numeric-only channels do not create local aliases. Mention a canonical handle."
+    store.add(
+        "system",
+        f"@{base} is ambiguous in {channel_label} ({active_text}). {detail} Use @all for deliberate fan-out.",
+        msg_type="system",
+        channel=channel or "general",
+    )
+
+
+def resolve_targets_for_channel(raw_targets: list[str], channel: str, sender: str) -> list[str]:
+    """Resolve router targets against active instances and channel-local aliases.
+
+    Base-family mentions like @claude are scoped to @claude-{channel} only when
+    that active instance exists and the channel is not purely numeric. If a base
+    mention is ambiguous, no instance is triggered.
+    """
+    if not registry:
+        return list(dict.fromkeys(raw_targets))
+
+    bases = set(registry.get_bases().keys())
+    resolved: list[str] = []
+    for raw in raw_targets:
+        target = (raw or "").strip().lower()
+        if not target:
+            continue
+
+        if target in bases:
+            active = [
+                inst for inst in registry.get_instances_for(target)
+                if inst.get("state") == "active"
+            ]
+            active_names = [inst["name"] for inst in active]
+
+            if not active:
+                resolved.append(target)
+                continue
+            if len(active) == 1:
+                resolved.append(active_names[0])
+                continue
+
+            alias = _local_alias_name(target, channel)
+            if alias and alias in active_names:
+                resolved.append(alias)
+                continue
+
+            _emit_target_resolution_warning(target, channel, sorted(active_names))
+            continue
+
+        canonical = registry.resolve_name(target)
+        if registry.is_registered(canonical):
+            resolved.append(canonical)
+        else:
+            # Preserve existing no-op/offline behavior for non-agent names.
+            resolved.append(target)
+
+    return list(dict.fromkeys(resolved))
 
 
 def _extract_agent_token(request: Request) -> str:
@@ -861,15 +949,7 @@ async def _handle_new_message(msg: dict):
             )
 
     raw_targets = router.get_targets(sender, text, channel)
-    # Resolve base family names to actual registered instances
-    # e.g. 'claude' → 'claude-prime' when slot-1 was renamed
-    targets = []
-    for t in raw_targets:
-        if registry:
-            targets.extend(registry.resolve_to_instances(t))
-        else:
-            targets.append(t)
-    targets = list(dict.fromkeys(targets))  # dedupe, preserve order
+    targets = resolve_targets_for_channel(raw_targets, channel, sender)
 
     if router.is_paused(channel):
         # Only emit the loop guard notice once per pause
@@ -2033,6 +2113,7 @@ async def trigger_agent_silent(request: Request):
     message = body.get("message", "").strip()
     channel = body.get("channel", "general")
     source_msg_id = body.get("source_msg_id")
+    sender = body.get("sender") or room_settings.get("username", "user")
     if not agent_name or not message:
         return JSONResponse({"error": "agent and message required"}, status_code=400)
 
@@ -2049,12 +2130,7 @@ async def trigger_agent_silent(request: Request):
                 f"use mcp to read #{channel} - you're mentioned, take appropriate action and respond "
                 f"- conversion request: use chat_propose_job to propose a job from the referenced message."
             )
-    # Resolve to instances if multi-instance
-    targets = [agent_name]
-    if registry:
-        resolved = registry.resolve_to_instances(agent_name)
-        if resolved:
-            targets = resolved
+    targets = resolve_targets_for_channel([agent_name], channel, sender)
     for target in targets:
         if agents.is_available(target):
             await agents.trigger(target, message=message, channel=channel, prompt=custom_prompt)
@@ -2158,13 +2234,7 @@ async def post_job_message(job_id: int, request: Request):
     if job:
         channel = job.get("channel", "general")
         raw_targets = router.get_targets(sender, text, channel)
-        targets = []
-        for t in raw_targets:
-            if registry:
-                targets.extend(registry.resolve_to_instances(t))
-            else:
-                targets.append(t)
-        targets = list(dict.fromkeys(targets))
+        targets = resolve_targets_for_channel(raw_targets, channel, sender)
 
         import mcp_bridge
         chat_msg = f"{sender}: {text}" if text else ""
