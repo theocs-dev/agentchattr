@@ -16,7 +16,10 @@ build/
 .idea/
 .gemini/
 .claude/
-tests/
+tests/*
+!tests/test_model_commands.py
+!tests/test_usage_telemetry.py
+!tests/test_unicode_mentions.py
 agents_lineup.svg
 docs/
 goals.py

@@ -26,6 +26,26 @@ let agentHats = {};  // { agent_name: svg_string }
 window.customRoles = [];  // saved custom roles from settings
 let colorOverrides = JSON.parse(localStorage.getItem('agentchattr-color-overrides') || '{}');
 let schedulesList = [];  // array of schedule objects from server
+let selectedAgentProfiles = {};  // { base: profile_name }
+let selectedAgentFastModes = {};  // { base: boolean }
+let selectedDefaultMention = 'all';
+const MENTION_NAME_SOURCE = String.raw`[\p{L}\p{N}_][\p{L}\p{N}\p{M}_-]*`;
+function mentionRegex(flags = 'gu') {
+    return new RegExp(`@(${MENTION_NAME_SOURCE})`, flags);
+}
+function bareMentionRegex(flags = 'gu') {
+    return new RegExp(`@${MENTION_NAME_SOURCE}`, flags);
+}
+
+function isLocalAliasChannel(channel) {
+    const ch = String(channel || '').trim().toLowerCase();
+    return ch.length > 0 && !/^\d+$/.test(ch);
+}
+
+function localAliasName(base, channel) {
+    if (!isLocalAliasChannel(channel)) return '';
+    return `${base}-${String(channel || '').trim().toLowerCase()}`;
+}
 
 // Expose globals that extracted modules (sessions.js, jobs.js) read via window.*
 // Using defineProperty so live values are always returned.
@@ -462,6 +482,7 @@ function connectWebSocket() {
             applyAgentConfig(event.data);
         } else if (event.type === 'base_colors') {
             baseColors = event.data || {};
+            buildDefaultMentionSettings();
         } else if (event.type === 'todos') {
             todos = {};
             for (const [id, status] of Object.entries(event.data)) {
@@ -747,7 +768,7 @@ function appendMessage(msg) {
 
         // Update last mentioned agent if message is from user (Ben)
         if (msg.sender.toLowerCase() === username.toLowerCase()) {
-            const mentions = msg.text.match(/@(\w[\w-]*)/g);
+            const mentions = msg.text.match(mentionRegex());
             if (mentions) {
                 const lastMention = mentions[mentions.length - 1].slice(1).toLowerCase();
                 // Check against registered agents (agentConfig keys are name labels)
@@ -833,6 +854,7 @@ function appendMessage(msg) {
     }
 
     container.appendChild(el);
+    updateTokenMeters();
 
     // Collapse consecutive job_created messages into a group
     if (msg.type === 'job_created' && window._collapseJobBreadcrumbs) {
@@ -888,7 +910,7 @@ function getColor(sender) {
 
 function colorMentions(textHtml) {
     // Match any @word — we'll resolve color per match
-    return textHtml.replace(/@(\w[\w-]*)/gi, (match, name) => {
+    return textHtml.replace(mentionRegex(), (match, name) => {
         const lower = name.toLowerCase();
         if (lower === 'both' || lower === 'all') {
             return `<span class="mention" style="color: var(--accent)">@${name}</span>`;
@@ -947,13 +969,22 @@ function applyAgentConfig(data) {
     agentConfig = {};
     for (const [name, cfg] of Object.entries(data)) {
         agentConfig[name.toLowerCase()] = cfg;
+        if (cfg.base && cfg.profile?.selected) {
+            selectedAgentProfiles[cfg.base] = cfg.profile.selected;
+        }
+        if (cfg.base && cfg.fast_mode?.supported) {
+            selectedAgentFastModes[cfg.base] = !!cfg.fast_mode.enabled;
+        }
     }
     buildStatusPills();
+    buildAgentProfileSettings();
+    buildDefaultMentionSettings();
     buildMentionToggles();
     buildSoundSettings();
     // Re-color any messages already rendered (e.g. from a reconnect)
     recolorMessages();
     updateJobReplyTargetUI();
+    updateTokenMeters();
 }
 
 function recolorMessages() {
@@ -1140,7 +1171,18 @@ function buildStatusPills() {
         pill.id = `status-${name}`;
         pill.title = `@${name}`;  // Tooltip: canonical name for manual @-typing
         pill.style.setProperty('--agent-color', colorOverrides[name] || cfg.color || '#4ade80');
-        pill.innerHTML = `<span class="status-dot"></span><span class="status-label">${escapeHtml(cfg.label || name)}</span>`;
+        const profile = getSelectedProfile(cfg);
+        const profileLabel = profile?.label || cfg.profile?.selected || '';
+        const fastLabel = getFastModeLabel(cfg);
+        const meta = [cfg.label || name, profileLabel, fastLabel].filter(Boolean).join(' · ');
+        pill.innerHTML = `
+            <span class="status-dot"></span>
+            <span class="status-body">
+                <span class="status-label">${escapeHtml('@' + name)}</span>
+                <span class="status-meta">${escapeHtml(meta)}</span>
+                <span class="token-meter"><span class="token-meter-fill"></span></span>
+                <span class="token-meter-label"></span>
+            </span>`;
         // Left-click to toggle pill popover (rename + role + color)
         pill.addEventListener('click', (e) => {
             e.stopPropagation();
@@ -1156,7 +1198,148 @@ function buildStatusPills() {
         container.appendChild(pill);
     }
     enableDragScroll(container);
+    updateTokenMeters();
 }
+
+function getSelectedProfile(cfg) {
+    const selected = cfg?.profile?.selected;
+    const profiles = cfg?.profile?.profiles || {};
+    return selected ? profiles[selected] : null;
+}
+
+function getFastModeLabel(cfg) {
+    if (!cfg?.fast_mode?.supported) return '';
+    return cfg.fast_mode.enabled ? 'Fast' : 'Standard';
+}
+
+function buildAgentProfileSettings() {
+    const bases = ['claude', 'codex'];
+    for (const base of bases) {
+        const field = document.getElementById(`agent-profile-${base}-field`);
+        const select = document.getElementById(`setting-profile-${base}`);
+        if (!field || !select) continue;
+
+        const instanceCfg = Object.values(agentConfig).find(cfg => cfg.base === base);
+        const profiles = instanceCfg?.profile?.profiles || {};
+        const selected = instanceCfg?.profile?.selected || selectedAgentProfiles[base] || '';
+        select.innerHTML = '';
+        const names = Object.keys(profiles);
+        if (names.length === 0) {
+            field.classList.add('hidden');
+            continue;
+        }
+        for (const name of names) {
+            const profile = profiles[name] || {};
+            const opt = document.createElement('option');
+            opt.value = name;
+            const label = profile.label || name;
+            const model = profile.model ? ` · ${profile.model}` : '';
+            const reasoning = profile.reasoning ? ` · ${profile.reasoning}` : '';
+            opt.textContent = `${label}${model}${reasoning}`;
+            if (name === selected) opt.selected = true;
+            select.appendChild(opt);
+        }
+        field.classList.remove('hidden');
+    }
+    buildAgentFastSettings();
+}
+
+function buildAgentFastSettings() {
+    const field = document.getElementById('agent-fast-claude-field');
+    const input = document.getElementById('setting-fast-claude');
+    if (!field || !input) return;
+
+    const instanceCfg = Object.values(agentConfig).find(cfg => cfg.base === 'claude');
+    const supported = instanceCfg?.fast_mode?.supported;
+    if (!supported) {
+        field.classList.add('hidden');
+        return;
+    }
+    const enabled = instanceCfg?.fast_mode?.enabled ?? selectedAgentFastModes.claude ?? false;
+    input.checked = !!enabled;
+    field.classList.remove('hidden');
+}
+
+function normalizeDefaultMentionValue(value) {
+    let target = String(value || 'all').trim().toLowerCase();
+    if (target.startsWith('@')) target = target.slice(1);
+    if (target === 'both') target = 'all';
+    return target || 'all';
+}
+
+function buildDefaultMentionSettings() {
+    const select = document.getElementById('setting-default-mention');
+    if (!select) return;
+
+    const selected = normalizeDefaultMentionValue(selectedDefaultMention);
+    const seen = new Set();
+    const options = [];
+    const addOption = (value, label) => {
+        const normalized = normalizeDefaultMentionValue(value);
+        if (seen.has(normalized)) return;
+        seen.add(normalized);
+        options.push({ value: normalized, label });
+    };
+
+    addOption('all', '@all');
+    addOption('none', 'Manual');
+
+    for (const [base, cfg] of Object.entries(baseColors).sort(([a], [b]) => a.localeCompare(b))) {
+        addOption(base, cfg?.label ? `@${base} · ${cfg.label}` : `@${base}`);
+    }
+    for (const [name, cfg] of Object.entries(agentConfig).sort(([a], [b]) => a.localeCompare(b))) {
+        addOption(name, cfg?.label ? `@${name} · ${cfg.label}` : `@${name}`);
+    }
+    if (!seen.has(selected)) {
+        addOption(selected, `@${selected}`);
+    }
+
+    select.innerHTML = '';
+    for (const opt of options) {
+        const el = document.createElement('option');
+        el.value = opt.value;
+        el.textContent = opt.label;
+        if (opt.value === selected) el.selected = true;
+        select.appendChild(el);
+    }
+    select.value = selected;
+}
+
+function formatTokenCount(n) {
+    if (!Number.isFinite(n) || n <= 0) return '0';
+    if (n >= 1000000) return (n / 1000000).toFixed(n >= 10000000 ? 0 : 1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(n >= 100000 ? 0 : 1) + 'k';
+    return String(n);
+}
+
+function updateTokenMeters() {
+    for (const [name, cfg] of Object.entries(agentConfig)) {
+        const pill = document.getElementById(`status-${name}`);
+        if (!pill) continue;
+        const profile = getSelectedProfile(cfg);
+        const limit = Number(profile?.context_limit || 0);
+        const usage = cfg.usage || null;
+        const ok = usage && usage.status === 'ok' && Number.isFinite(Number(usage.used_tokens));
+        const used = ok ? Number(usage.used_tokens) : 0;
+        const pct = limit && ok ? Math.min(100, used / limit * 100) : 0;
+        const fill = pill.querySelector('.token-meter-fill');
+        const label = pill.querySelector('.token-meter-label');
+        if (fill) fill.style.width = `${pct}%`;
+        if (label) {
+            label.textContent = ok && limit
+                ? `${formatTokenCount(used)} / ${formatTokenCount(limit)}`
+                : 'usage unavailable';
+        }
+        const model = profile?.model || 'default model';
+        const reasoning = profile?.reasoning || 'default reasoning';
+        const fastLabel = getFastModeLabel(cfg);
+        const usageText = ok && limit
+            ? `${formatTokenCount(used)} / ${formatTokenCount(limit)}`
+            : 'usage unavailable';
+        pill.title = `@${name} · ${model} · ${reasoning}${fastLabel ? ` · ${fastLabel}` : ''} · ${usageText}`;
+    }
+}
+window.updateTokenMeters = updateTokenMeters;
 
 // --- Role presets (shared by pill popover + bubble picker) ---
 
@@ -1711,7 +1894,12 @@ function updateStatus(data) {
             _agentRoles[name] = info.role;
             _syncBubbleRolePills(name);
         }
+
+        if (agentConfig[name]) {
+            agentConfig[name].usage = info.usage || null;
+        }
     }
+    updateTokenMeters();
 }
 
 function updateTyping(agent, active) {
@@ -1744,6 +1932,10 @@ function applySettings(data) {
         document.body.classList.add('font-' + data.font);
         document.getElementById('setting-font').value = data.font;
     }
+    if (data.default_mention !== undefined) {
+        selectedDefaultMention = normalizeDefaultMentionValue(data.default_mention);
+        buildDefaultMentionSettings();
+    }
     if (data.max_agent_hops !== undefined) {
         document.getElementById('setting-hops').value = data.max_agent_hops;
     }
@@ -1759,6 +1951,14 @@ function applySettings(data) {
     }
     if (Array.isArray(data.custom_roles)) {
         window.customRoles = data.custom_roles;
+    }
+    if (data.agent_profiles && typeof data.agent_profiles === 'object') {
+        selectedAgentProfiles = data.agent_profiles;
+        buildAgentProfileSettings();
+    }
+    if (data.agent_fast_modes && typeof data.agent_fast_modes === 'object') {
+        selectedAgentFastModes = data.agent_fast_modes;
+        buildAgentFastSettings();
     }
     if (data.channels && Array.isArray(data.channels)) {
         channelList = data.channels;
@@ -1863,6 +2063,17 @@ function saveSettings() {
     const newHistory = histVal === 'all' ? 'all' : (parseInt(histVal) || 50);
     const newContrast = document.getElementById('setting-contrast').value;
     const newRulesRefresh = document.getElementById('setting-rules-refresh').value;
+    const defaultMention = normalizeDefaultMentionValue(
+        document.getElementById('setting-default-mention')?.value || selectedDefaultMention
+    );
+    const agentProfiles = {};
+    for (const base of ['claude', 'codex']) {
+        const select = document.getElementById(`setting-profile-${base}`);
+        if (select && select.value) agentProfiles[base] = select.value;
+    }
+    const agentFastModes = {};
+    const claudeFast = document.getElementById('setting-fast-claude');
+    if (claudeFast) agentFastModes.claude = !!claudeFast.checked;
 
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
@@ -1870,10 +2081,13 @@ function saveSettings() {
             data: {
                 username: newUsername || 'user',
                 font: newFont,
+                default_mention: defaultMention,
                 max_agent_hops: parseInt(newHops) || 4,
                 history_limit: newHistory,
                 contrast: newContrast,
                 rules_refresh_interval: parseInt(newRulesRefresh) || 0,
+                agent_profiles: agentProfiles,
+                agent_fast_modes: agentFastModes,
             }
         }));
     }
@@ -1896,8 +2110,9 @@ function setupSettingsKeys() {
     }
 
     // Auto-save on change for selects, escape to close
-    for (const id of ['setting-font', 'setting-history', 'setting-contrast', 'setting-rules-refresh']) {
+    for (const id of ['setting-font', 'setting-default-mention', 'setting-history', 'setting-contrast', 'setting-rules-refresh', 'setting-profile-claude', 'setting-profile-codex', 'setting-fast-claude']) {
         const el = document.getElementById(id);
+        if (!el) continue;
         el.addEventListener('change', () => {
             // Apply contrast immediately (don't wait for server round-trip)
             if (id === 'setting-contrast') {
@@ -2045,6 +2260,8 @@ const SLASH_COMMANDS = [
     { cmd: '/poetry sonnet', desc: 'Agents write a sonnet about the codebase', broadcast: true },
     { cmd: '/summary', desc: 'Summarize recent messages — tag an agent (e.g. /summary @claude)', broadcast: false, needsMention: true },
     { cmd: '/summarise', desc: 'Summarize recent messages — tag an agent (e.g. /summarise @claude)', broadcast: false, needsMention: true, hidden: true },
+    { cmd: '/model', desc: 'List or set launch profile (e.g. /model claude max, /model codex xhigh)', broadcast: false },
+    { cmd: '/fast', desc: 'Toggle Claude fast mode (or use /fast on, /fast off, /fast status)', broadcast: false },
     { cmd: '/continue', desc: 'Resume after loop guard pauses', broadcast: false },
     { cmd: '/clear', desc: 'Clear messages in current channel', broadcast: false },
 ];
@@ -2104,14 +2321,38 @@ function selectSlashCommand(cmd) {
 
 // --- Mention autocomplete ---
 
-function getMentionCandidates() {
+function getMentionCandidates(channel = activeChannel) {
     // Build list: registered agents + "all agents" + username (self) + known humans
     const candidates = [];
+    const effectiveChannel = String(channel || activeChannel || 'general').trim().toLowerCase();
     for (const [name, cfg] of Object.entries(agentConfig)) {
         if (cfg.state === 'pending') continue;
-        candidates.push({ name, label: cfg.label || name, color: cfg.color });
+        candidates.push({
+            name,
+            label: cfg.label || name,
+            handle: `@${name}`,
+            color: cfg.color,
+        });
     }
-    candidates.push({ name: 'all agents', label: 'all agents', color: 'var(--accent)' });
+    const bases = new Set(
+        Object.values(agentConfig)
+            .map(cfg => cfg.base)
+            .filter(Boolean)
+    );
+    for (const base of bases) {
+        const alias = localAliasName(base, effectiveChannel);
+        if (!alias || !(alias in agentConfig) || agentConfig[alias].state === 'pending') continue;
+        const cfg = agentConfig[alias];
+        const familyLabel = baseColors[base]?.label || base;
+        candidates.push({
+            name: base,
+            label: `${familyLabel} in #${effectiveChannel}`,
+            handle: `@${base} -> @${alias}`,
+            color: cfg.color,
+            aliasTarget: alias,
+        });
+    }
+    candidates.push({ name: 'all', label: 'all agents', handle: '@all', color: 'var(--accent)' });
     return candidates;
 }
 
@@ -2150,7 +2391,10 @@ function updateMentionMenu() {
 
     const candidates = getMentionCandidates();
     const matches = candidates.filter(c =>
-        c.name.toLowerCase().includes(query) || c.label.toLowerCase().includes(query)
+        c.name.toLowerCase().includes(query)
+        || c.label.toLowerCase().includes(query)
+        || (c.handle || '').toLowerCase().includes(query)
+        || (c.aliasTarget || '').toLowerCase().includes(query)
     );
 
     if (matches.length === 0) {
@@ -2166,7 +2410,7 @@ function updateMentionMenu() {
         const row = document.createElement('div');
         row.className = 'mention-item' + (i === mentionMenuIndex ? ' active' : '');
         row.dataset.name = item.name;
-        row.innerHTML = `<span class="mention-dot" style="background: ${item.color}"></span><span class="mention-name">${escapeHtml(item.label)}</span>`;
+        row.innerHTML = `<span class="mention-dot" style="background: ${item.color}"></span><span class="mention-name"><span>${escapeHtml(item.label)}</span><span class="mention-handle">&middot; ${escapeHtml(item.handle || '@' + item.name)}</span></span>`;
         row.addEventListener('mousedown', (e) => {
             e.preventDefault();
             selectMention(item.name);
@@ -2317,7 +2561,7 @@ function sendMessage() {
             skipMentions = true;
         }
         // Commands that need an @mention — show hint and keep command in input
-        if (matchedCmd && matchedCmd.needsMention && !/@\w[\w-]*/.test(text)) {
+        if (matchedCmd && matchedCmd.needsMention && !bareMentionRegex().test(text)) {
             const canonical = matchedCmd.cmd.split(/\s/)[0];  // e.g. '/summary'
             input.value = canonical + ' @';
             input.focus();
@@ -2923,8 +3167,8 @@ function buildMentionToggles() {
         const btn = document.createElement('button');
         btn.className = 'mention-toggle';
         btn.dataset.agent = name;
-        btn.textContent = `@${cfg.label || name}`;
-        btn.title = `@${name}`;  // Tooltip: canonical name
+        btn.textContent = `@${name}`;
+        btn.title = cfg.label ? `${cfg.label} · @${name}` : `@${name}`;
         btn.style.setProperty('--agent-color', colorOverrides[name] || cfg.color);
         // Restore active state for mentions that survived the rebuild
         if (activeMentions.has(name)) {
@@ -3511,7 +3755,7 @@ function updateSchedulePopoverState() {
     const submitBtn = pop.querySelector('.sched-pop-submit');
     const input = document.getElementById('input');
     const text = input ? input.value.trim() : '';
-    const mentionMatches = text.match(/@(\w[\w-]*)/g) || [];
+    const mentionMatches = text.match(mentionRegex()) || [];
     const targets = new Set(mentionMatches.map(m => m.slice(1)));
     for (const name of activeMentions) targets.add(name);
     if (targets.size === 0) {
@@ -3528,10 +3772,10 @@ async function submitSchedulePopover() {
     const text = input ? input.value.trim() : '';
 
     // Gather targets
-    const mentionMatches = text.match(/@(\w[\w-]*)/g) || [];
+    const mentionMatches = text.match(mentionRegex()) || [];
     const targets = new Set(mentionMatches.map(m => m.slice(1)));
     for (const name of activeMentions) targets.add(name);
-    let prompt = text.replace(/@\w[\w-]*/g, '').trim();
+    let prompt = text.replace(bareMentionRegex(), '').trim();
 
     const errEl = document.getElementById('sched-pop-error');
 
@@ -3760,7 +4004,7 @@ function _helpCardDefs() {
             light: true,
             html:
             '<div class="hg-module-title">Mentions <span class="hg-loc">pills above composer</span></div>' +
-            '<p class="hg-module-desc">Type <strong>@</strong> in the composer to mention an agent. The pills above the input let you pre-select who to address. Selected agents are mentioned automatically when you send.</p>' +
+            '<p class="hg-module-desc">Type <strong>@</strong> in the composer to mention an agent. Messages without an explicit mention use the Default @ setting. The pills above the input let you pre-select who to address.</p>' +
             '<p class="hg-module-tip">Mentioned agents receive a trigger and will respond in the channel.</p>'
         },
         {

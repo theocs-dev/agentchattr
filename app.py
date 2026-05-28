@@ -7,6 +7,7 @@ import sys
 import threading
 import uuid
 import logging
+import time as _time
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
@@ -42,6 +43,10 @@ session_store: SessionStore | None = None
 session_engine: SessionEngine | None = None
 config: dict = {}
 ws_clients: set[WebSocket] = set()
+usage_snapshots: dict[str, dict] = {}
+_target_resolution_warning_times: dict[tuple, float] = {}
+_TARGET_RESOLUTION_WARNING_TTL = 30
+_DEFAULT_MENTION_TARGET_RE = _re.compile(r"^[\w-]{1,64}$", _re.UNICODE)
 
 # --- Security: session token (set by configure()) ---
 session_token: str = ""
@@ -54,7 +59,10 @@ room_settings: dict = {
     "channels": ["general"],
     "history_limit": "all",
     "contrast": "normal",
+    "default_mention": "all",
     "custom_roles": [],
+    "agent_profiles": {},
+    "agent_fast_modes": {},
 }
 
 # Channel validation
@@ -124,6 +132,33 @@ def _settings_path() -> Path:
     return Path(data_dir) / "settings.json"
 
 
+def _normalize_default_mention(value, fallback: str = "all") -> str:
+    if not isinstance(value, str):
+        return fallback
+    target = value.strip().lower()
+    if target.startswith("@"):
+        target = target[1:]
+    if target == "both":
+        target = "all"
+    if target in {"all", "none"}:
+        return target
+    if _DEFAULT_MENTION_TARGET_RE.match(target):
+        return target
+    return fallback
+
+
+def _configured_default_mention() -> str:
+    raw = room_settings.get("default_mention")
+    if raw is None:
+        raw = config.get("routing", {}).get("default", "all")
+    return _normalize_default_mention(raw, fallback="all")
+
+
+def _apply_default_mention_to_router() -> None:
+    if router:
+        router.default_mention = _configured_default_mention()
+
+
 def _load_settings():
     global room_settings
     p = _settings_path()
@@ -138,12 +173,198 @@ def _load_settings():
         room_settings["channels"] = ["general"]
     elif "general" not in room_settings["channels"]:
         room_settings["channels"].insert(0, "general")
+    if not isinstance(room_settings.get("agent_profiles"), dict):
+        room_settings["agent_profiles"] = {}
+    if not isinstance(room_settings.get("agent_fast_modes"), dict):
+        room_settings["agent_fast_modes"] = {}
+    room_settings["default_mention"] = _configured_default_mention()
+    for base, cfg in config.get("agents", {}).items():
+        profiles = cfg.get("profiles", {})
+        if isinstance(profiles, dict) and profiles:
+            selected = room_settings["agent_profiles"].get(base)
+            if selected not in profiles:
+                room_settings["agent_profiles"][base] = _default_profile_name(base)
+        if _fast_mode_supported(base) and base not in room_settings["agent_fast_modes"]:
+            room_settings["agent_fast_modes"][base] = _default_fast_mode_enabled(base)
 
 
 def _save_settings():
     p = _settings_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(room_settings, indent=2), "utf-8")
+
+
+def _profile_catalog_for(base: str) -> dict:
+    agent_cfg = config.get("agents", {}).get(base, {})
+    profiles = agent_cfg.get("profiles", {})
+    if isinstance(profiles, dict):
+        return profiles
+    return {}
+
+
+def _default_profile_name(base: str) -> str:
+    profiles = _profile_catalog_for(base)
+    for name, profile in profiles.items():
+        if isinstance(profile, dict) and profile.get("default"):
+            return name
+    return next(iter(profiles), "")
+
+
+def _selected_profile_name(base: str) -> str:
+    selected = room_settings.get("agent_profiles", {})
+    if not isinstance(selected, dict):
+        return _default_profile_name(base)
+    name = str(selected.get(base, "")).strip()
+    profiles = _profile_catalog_for(base)
+    if name in profiles:
+        return name
+    return _default_profile_name(base)
+
+
+def _public_profile(profile: dict) -> dict:
+    return {
+        "label": profile.get("label", ""),
+        "model": profile.get("model", ""),
+        "reasoning": profile.get("reasoning", ""),
+        "context_limit": int(profile.get("context_limit", 0) or 0),
+    }
+
+
+def _fast_mode_supported(base: str) -> bool:
+    return base == "claude" and base in config.get("agents", {})
+
+
+def _default_fast_mode_enabled(base: str) -> bool:
+    agent_cfg = config.get("agents", {}).get(base, {})
+    if "fast_mode_default" in agent_cfg:
+        return bool(agent_cfg.get("fast_mode_default"))
+    profiles = _profile_catalog_for(base)
+    default_profile = profiles.get(_default_profile_name(base), {})
+    return bool(default_profile.get("fast_mode", False)) if isinstance(default_profile, dict) else False
+
+
+def _selected_fast_mode_enabled(base: str) -> bool:
+    if not _fast_mode_supported(base):
+        return False
+    selected = room_settings.get("agent_fast_modes", {})
+    if isinstance(selected, dict) and base in selected:
+        return bool(selected.get(base))
+    return _default_fast_mode_enabled(base)
+
+
+def _fast_mode_payload_for(base: str) -> dict:
+    return {
+        "supported": _fast_mode_supported(base),
+        "enabled": _selected_fast_mode_enabled(base),
+    }
+
+
+def _profile_payload_for(base: str) -> dict:
+    profiles = _profile_catalog_for(base)
+    selected = _selected_profile_name(base)
+    return {
+        "selected": selected,
+        "profiles": {
+            name: _public_profile(profile)
+            for name, profile in profiles.items()
+            if isinstance(profile, dict)
+        },
+    }
+
+
+def _agent_config_for_client() -> dict:
+    agent_cfg = registry.get_agent_config() if registry else {}
+    for info in agent_cfg.values():
+        base = info.get("base", "")
+        if base:
+            info["profile"] = _profile_payload_for(base)
+            info["fast_mode"] = _fast_mode_payload_for(base)
+    return agent_cfg
+
+
+def _is_local_alias_channel(channel: str) -> bool:
+    channel = (channel or "").strip().lower()
+    return bool(channel) and not channel.isdigit()
+
+
+def _local_alias_name(base: str, channel: str) -> str | None:
+    if not _is_local_alias_channel(channel):
+        return None
+    return f"{base}-{channel.strip().lower()}"
+
+
+def _emit_target_resolution_warning(base: str, channel: str, active_names: list[str]):
+    if not store:
+        return
+    key = (channel or "general", base, tuple(active_names))
+    now = _time.time()
+    last = _target_resolution_warning_times.get(key, 0)
+    if now - last < _TARGET_RESOLUTION_WARNING_TTL:
+        return
+    _target_resolution_warning_times[key] = now
+
+    channel_label = f"#{channel or 'general'}"
+    active_text = ", ".join(f"@{name}" for name in active_names)
+    if _is_local_alias_channel(channel):
+        expected = f"@{base}-{channel.strip().lower()}"
+        detail = f"Rename one active instance to {expected} or mention a canonical handle."
+    else:
+        detail = "Numeric-only channels do not create local aliases. Mention a canonical handle."
+    store.add(
+        "system",
+        f"@{base} is ambiguous in {channel_label} ({active_text}). {detail} Use @all for deliberate fan-out.",
+        msg_type="system",
+        channel=channel or "general",
+    )
+
+
+def resolve_targets_for_channel(raw_targets: list[str], channel: str, sender: str) -> list[str]:
+    """Resolve router targets against active instances and channel-local aliases.
+
+    Base-family mentions like @claude are scoped to @claude-{channel} only when
+    that active instance exists and the channel is not purely numeric. If a base
+    mention is ambiguous, no instance is triggered.
+    """
+    if not registry:
+        return list(dict.fromkeys(raw_targets))
+
+    bases = set(registry.get_bases().keys())
+    resolved: list[str] = []
+    for raw in raw_targets:
+        target = (raw or "").strip().lower()
+        if not target:
+            continue
+
+        if target in bases:
+            active = [
+                inst for inst in registry.get_instances_for(target)
+                if inst.get("state") == "active"
+            ]
+            active_names = [inst["name"] for inst in active]
+
+            if not active:
+                resolved.append(target)
+                continue
+            if len(active) == 1:
+                resolved.append(active_names[0])
+                continue
+
+            alias = _local_alias_name(target, channel)
+            if alias and alias in active_names:
+                resolved.append(alias)
+                continue
+
+            _emit_target_resolution_warning(target, channel, sorted(active_names))
+            continue
+
+        canonical = registry.resolve_name(target)
+        if registry.is_registered(canonical):
+            resolved.append(canonical)
+        else:
+            # Preserve existing no-op/offline behavior for non-agent names.
+            resolved.append(target)
+
+    return list(dict.fromkeys(resolved))
 
 
 def _extract_agent_token(request: Request) -> str:
@@ -209,7 +430,7 @@ def _install_security_middleware(token: str, cfg: dict):
             # Allow registered agents to authenticate via Bearer token
             # for /api/messages and /api/send (no browser session needed).
             auth_header = request.headers.get("authorization", "")
-            if auth_header.lower().startswith("bearer ") and (path in ("/api/messages", "/api/send") or path.startswith("/api/rules/")):
+            if auth_header.lower().startswith("bearer ") and (path in ("/api/messages", "/api/send", "/api/terminal_event", "/api/usage_event") or path.startswith("/api/rules/")):
                 bearer = auth_header[7:].strip()
                 if _self.registry and _self.registry.resolve_token(bearer):
                     return await call_next(request)
@@ -303,6 +524,7 @@ def configure(cfg: dict, session_token: str = ""):
     store.on_message(_on_store_message)
 
     _load_settings()
+    _apply_default_mention_to_router()
     _load_hats()
 
     # Apply saved loop guard setting
@@ -793,15 +1015,7 @@ async def _handle_new_message(msg: dict):
             )
 
     raw_targets = router.get_targets(sender, text, channel)
-    # Resolve base family names to actual registered instances
-    # e.g. 'claude' → 'claude-prime' when slot-1 was renamed
-    targets = []
-    for t in raw_targets:
-        if registry:
-            targets.extend(registry.resolve_to_instances(t))
-        else:
-            targets.append(t)
-    targets = list(dict.fromkeys(targets))  # dedupe, preserve order
+    targets = resolve_targets_for_channel(raw_targets, channel, sender)
 
     if router.is_paused(channel):
         # Only emit the loop guard notice once per pause
@@ -865,9 +1079,17 @@ async def broadcast(msg: dict):
     ws_clients.difference_update(dead)
 
 
-async def broadcast_status():
+def _status_payload() -> dict:
     status = agents.get_status()
+    for name, snapshot in usage_snapshots.items():
+        if name in status:
+            status[name]["usage"] = snapshot
     status["paused"] = any(router.is_paused(ch) for ch in room_settings.get("channels", ["general"]))
+    return status
+
+
+async def broadcast_status():
+    status = _status_payload()
     data = json.dumps({"type": "status", "data": status})
     dead = set()
     for client in list(ws_clients):
@@ -876,6 +1098,195 @@ async def broadcast_status():
         except Exception:
             dead.add(client)
     ws_clients.difference_update(dead)
+
+
+def _format_profile_list(base: str) -> str:
+    payload = _profile_payload_for(base)
+    profiles = payload.get("profiles", {})
+    if not profiles:
+        return f"{base}: no profiles configured"
+    parts = []
+    if _fast_mode_supported(base):
+        state = "ON" if _selected_fast_mode_enabled(base) else "OFF"
+        parts.append(f"{base} fast mode: {state}")
+    for name, profile in profiles.items():
+        marker = "*" if name == payload.get("selected") else "-"
+        label = profile.get("label") or name
+        model = profile.get("model") or "default"
+        reasoning = profile.get("reasoning") or "default"
+        limit = profile.get("context_limit") or 0
+        limit_text = f"{limit:,}".replace(",", " ") if limit else "unknown"
+        limit_kind = "window" if base == "claude" else "budget"
+        parts.append(f"{marker} {base} {name}: {label}, model {model}, reasoning {reasoning}, {limit_kind} {limit_text}")
+    return "\n".join(parts)
+
+
+def _leading_mentions_and_command_text(text: str) -> tuple[list[str], str]:
+    mentions: list[str] = []
+    rest = text.lstrip()
+    while rest.startswith("@"):
+        match = _re.match(r"@([\w-]+)(?:[,:])?\s*", rest)
+        if not match:
+            break
+        mentions.append(match.group(1).lower())
+        rest = rest[match.end():].lstrip()
+    return mentions, rest
+
+
+def _profile_base_from_mentions(mentions: list[str]) -> list[str]:
+    bases: list[str] = []
+    instance_cfg = registry.get_agent_config() if registry else {}
+    for mention in mentions:
+        base = mention
+        if mention in instance_cfg:
+            base = instance_cfg[mention].get("base", mention)
+        if _profile_catalog_for(base) and base not in bases:
+            bases.append(base)
+    return bases
+
+
+def _set_agent_profile(base: str, profile_name: str) -> str | None:
+    profiles = _profile_catalog_for(base)
+    if not profiles:
+        return f"No profiles configured for {base}."
+    if profile_name not in profiles:
+        wanted = profile_name.strip().lower()
+        matches = [
+            name for name, profile in profiles.items()
+            if isinstance(profile, dict)
+            and (
+                name.lower() == wanted
+                or str(profile.get("label", "")).strip().lower() == wanted
+                or str(profile.get("reasoning", "")).strip().lower() == wanted
+            )
+        ]
+        if len(matches) == 1:
+            profile_name = matches[0]
+        else:
+            available = ", ".join(profiles.keys())
+            return f"Unknown profile '{profile_name}' for {base}. Available: {available}."
+    selected = room_settings.setdefault("agent_profiles", {})
+    selected[base] = profile_name
+    _save_settings()
+    return None
+
+
+_FAST_ON_VALUES = {"on", "enable", "enabled", "true", "1", "yes"}
+_FAST_OFF_VALUES = {"off", "disable", "disabled", "false", "0", "no"}
+
+
+def _set_fast_mode(base: str, enabled: bool) -> str | None:
+    if not _fast_mode_supported(base):
+        return f"Fast mode is only configured for Claude."
+    selected = room_settings.setdefault("agent_fast_modes", {})
+    selected[base] = bool(enabled)
+    _save_settings()
+    return None
+
+
+def _format_fast_mode_status(base: str = "claude") -> str:
+    if not _fast_mode_supported(base):
+        return "Fast mode is only configured for Claude."
+    state = "ON" if _selected_fast_mode_enabled(base) else "OFF"
+    return f"{base} fast mode is {state}. Restart the {base} wrapper for terminal flags to change."
+
+
+async def _handle_fast_command(cmd_parts: list[str], channel: str, mentioned_bases: list[str] | None = None) -> None:
+    mentioned_bases = mentioned_bases or []
+    parts = [part.strip() for part in cmd_parts[1:] if part.strip()]
+    base = mentioned_bases[0] if mentioned_bases else "claude"
+
+    if parts and parts[0].startswith("@"):
+        base = parts.pop(0).lower().lstrip("@")
+    elif parts and parts[0].lower() in config.get("agents", {}):
+        base = parts.pop(0).lower()
+
+    if not _fast_mode_supported(base):
+        store.add("system", "Fast mode is only configured for Claude.", msg_type="system", channel=channel)
+        return
+
+    if parts and parts[0].lower() in {"status", "state", "list", "show"}:
+        store.add("system", _format_fast_mode_status(base), msg_type="system", channel=channel)
+        return
+
+    if not parts:
+        enabled = not _selected_fast_mode_enabled(base)
+    else:
+        value = parts[0].lower()
+        if value in _FAST_ON_VALUES:
+            enabled = True
+        elif value in _FAST_OFF_VALUES:
+            enabled = False
+        else:
+            store.add(
+                "system",
+                "Usage: /fast, /fast on, /fast off, /fast status, or @claude /fast off.",
+                msg_type="system",
+                channel=channel,
+            )
+            return
+
+    err = _set_fast_mode(base, enabled)
+    if err:
+        store.add("system", err, msg_type="system", channel=channel)
+        return
+
+    state = "ON" if enabled else "OFF"
+    store.add(
+        "system",
+        f"{base} fast mode set to {state}. Restart the {base} wrapper for this launch setting to take effect.",
+        msg_type="system",
+        channel=channel,
+    )
+    await broadcast_settings()
+    await broadcast_agents()
+    await broadcast_status()
+
+
+async def _handle_model_command(cmd_parts: list[str], channel: str, mentioned_bases: list[str] | None = None) -> None:
+    mentioned_bases = mentioned_bases or []
+    if len(cmd_parts) == 1:
+        bases = mentioned_bases or ["claude", "codex"]
+        store.add("system", "\n".join(_format_profile_list(base) for base in bases), msg_type="system", channel=channel)
+        return
+
+    if len(cmd_parts) == 2 and mentioned_bases:
+        base = mentioned_bases[0]
+        profile_name = cmd_parts[1]
+    elif len(cmd_parts) == 2 and cmd_parts[1].startswith("@"):
+        base = cmd_parts[1].lower().lstrip("@")
+        store.add("system", _format_profile_list(base), msg_type="system", channel=channel)
+        return
+    elif len(cmd_parts) >= 3:
+        base = cmd_parts[1].lower().lstrip("@")
+        profile_name = cmd_parts[2]
+    else:
+        store.add(
+            "system",
+            "Usage: /model claude max, /model codex xhigh, or @codex /model xhigh.",
+            msg_type="system",
+            channel=channel,
+        )
+        return
+
+    err = _set_agent_profile(base, profile_name)
+    if err:
+        store.add("system", err, msg_type="system", channel=channel)
+        return
+
+    resolved_profile_name = room_settings.get("agent_profiles", {}).get(base, profile_name)
+    payload = _profile_payload_for(base)
+    profile = payload["profiles"].get(resolved_profile_name, {})
+    label = profile.get("label") or resolved_profile_name
+    store.add(
+        "system",
+        f"{base} profile set to {label}. Restart the {base} wrapper for this launch profile to take effect.",
+        msg_type="system",
+        channel=channel,
+    )
+    await broadcast_settings()
+    await broadcast_agents()
+    await broadcast_status()
 
 
 async def broadcast_typing(agent_name: str, is_typing: bool):
@@ -982,7 +1393,7 @@ async def broadcast_hats():
 
 async def broadcast_agents():
     """Send updated agent config (from registry) to all WebSocket clients."""
-    agent_cfg = registry.get_agent_config() if registry else {}
+    agent_cfg = _agent_config_for_client()
     data = json.dumps({"type": "agents", "data": agent_cfg})
     dead = set()
     for client in list(ws_clients):
@@ -1028,7 +1439,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.send_text(json.dumps({"type": "settings", "data": room_settings}))
 
     # Send registered instances (used for pills/mentions)
-    agent_cfg = registry.get_agent_config() if registry else {}
+    agent_cfg = _agent_config_for_client()
     await websocket.send_text(json.dumps({"type": "agents", "data": agent_cfg}))
 
     # Send base agent colors (used for message coloring, no pills)
@@ -1095,9 +1506,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not text and not attachments:
                     continue
 
-                # Command handling
-                if text.startswith("/"):
-                    cmd_parts = text.split()
+                # Command handling. Local launch-setting commands also accept
+                # leading mentions, e.g. "@codex /model xhigh".
+                leading_mentions, command_text = _leading_mentions_and_command_text(text)
+                addressed_cmd = command_text.split(None, 1)[0].lower() if command_text else ""
+                addressed_local_command = not text.startswith("/") and addressed_cmd in {"/model", "/fast"}
+                if text.startswith("/") or addressed_local_command:
+                    cmd_text = command_text if addressed_local_command else text
+                    cmd_parts = cmd_text.split()
                     cmd = cmd_parts[0].lower()
                     if cmd == "/clear":
                         store.clear(channel=channel)
@@ -1108,9 +1524,23 @@ async def websocket_endpoint(websocket: WebSocket):
                         store.add("system", "Resuming agent conversation...", msg_type="system", channel=channel)
                         await broadcast_status()
                         continue
-                    # Broadcast slash commands — expand without storing the raw command.
-                    # _handle_new_message will store the expanded version.
+                    if cmd == "/model":
+                        await _handle_model_command(
+                            cmd_parts,
+                            channel,
+                            _profile_base_from_mentions(leading_mentions) if addressed_local_command else [],
+                        )
+                        continue
+                    if cmd == "/fast":
+                        await _handle_fast_command(
+                            cmd_parts,
+                            channel,
+                            _profile_base_from_mentions(leading_mentions) if addressed_local_command else [],
+                        )
+                        continue
                     if cmd in ("/hatmaking", "/artchallenge", "/roastreview", "/poetry"):
+                        # Broadcast slash commands — expand without storing the raw command.
+                        # _handle_new_message will store the expanded version.
                         await _handle_new_message({"sender": sender, "text": text, "channel": channel})
                         continue
 
@@ -1235,12 +1665,20 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif event.get("type") == "update_settings":
                 new = event.get("data", {})
+                changed_profiles = []
+                changed_fast_modes = []
                 if "title" in new and isinstance(new["title"], str):
                     room_settings["title"] = new["title"].strip() or "agentchattr"
                 if "username" in new and isinstance(new["username"], str):
                     room_settings["username"] = new["username"].strip() or "user"
                 if "font" in new and new["font"] in ("mono", "serif", "sans"):
                     room_settings["font"] = new["font"]
+                if "default_mention" in new:
+                    room_settings["default_mention"] = _normalize_default_mention(
+                        new["default_mention"],
+                        fallback=room_settings.get("default_mention", "all"),
+                    )
+                    _apply_default_mention_to_router()
                 if "max_agent_hops" in new:
                     try:
                         hops = int(new["max_agent_hops"])
@@ -1272,8 +1710,50 @@ async def websocket_endpoint(websocket: WebSocket):
                         str(r).strip()[:20] for r in new["custom_roles"]
                         if isinstance(r, str) and r.strip()
                     ][:20]
+                if "agent_profiles" in new and isinstance(new["agent_profiles"], dict):
+                    selected = room_settings.setdefault("agent_profiles", {})
+                    for base, profile_name in new["agent_profiles"].items():
+                        if not isinstance(base, str) or not isinstance(profile_name, str):
+                            continue
+                        base = base.strip().lower()
+                        profile_name = profile_name.strip()
+                        if profile_name in _profile_catalog_for(base):
+                            if selected.get(base) != profile_name:
+                                changed_profiles.append((base, profile_name))
+                            selected[base] = profile_name
+                if "agent_fast_modes" in new and isinstance(new["agent_fast_modes"], dict):
+                    selected_fast = room_settings.setdefault("agent_fast_modes", {})
+                    for base, enabled in new["agent_fast_modes"].items():
+                        if not isinstance(base, str):
+                            continue
+                        base = base.strip().lower()
+                        if not _fast_mode_supported(base):
+                            continue
+                        next_enabled = bool(enabled)
+                        if bool(selected_fast.get(base, _default_fast_mode_enabled(base))) != next_enabled:
+                            changed_fast_modes.append((base, next_enabled))
+                        selected_fast[base] = next_enabled
                 _save_settings()
                 await broadcast_settings()
+                await broadcast_agents()
+                await broadcast_status()
+                for base, profile_name in changed_profiles:
+                    profile = _profile_payload_for(base)["profiles"].get(profile_name, {})
+                    label = profile.get("label") or profile_name
+                    store.add(
+                        "system",
+                        f"{base} profile set to {label}. Restart the {base} wrapper for this launch profile to take effect.",
+                        msg_type="system",
+                        channel=_last_active_channel,
+                    )
+                for base, enabled in changed_fast_modes:
+                    state = "ON" if enabled else "OFF"
+                    store.add(
+                        "system",
+                        f"{base} fast mode set to {state}. Restart the {base} wrapper for this launch setting to take effect.",
+                        msg_type="system",
+                        channel=_last_active_channel,
+                    )
 
             elif event.get("type") == "rename_agent":
                 agent_name = (event.get("name") or "").strip()
@@ -1534,9 +2014,7 @@ async def api_send(request: Request):
 
 @app.get("/api/status")
 async def get_status():
-    status = agents.get_status()
-    status["paused"] = any(router.is_paused(ch) for ch in room_settings.get("channels", ["general"]))
-    return status
+    return _status_payload()
 
 
 @app.get("/api/settings")
@@ -1811,6 +2289,7 @@ async def trigger_agent_silent(request: Request):
     message = body.get("message", "").strip()
     channel = body.get("channel", "general")
     source_msg_id = body.get("source_msg_id")
+    sender = body.get("sender") or room_settings.get("username", "user")
     if not agent_name or not message:
         return JSONResponse({"error": "agent and message required"}, status_code=400)
 
@@ -1827,12 +2306,7 @@ async def trigger_agent_silent(request: Request):
                 f"use mcp to read #{channel} - you're mentioned, take appropriate action and respond "
                 f"- conversion request: use chat_propose_job to propose a job from the referenced message."
             )
-    # Resolve to instances if multi-instance
-    targets = [agent_name]
-    if registry:
-        resolved = registry.resolve_to_instances(agent_name)
-        if resolved:
-            targets = resolved
+    targets = resolve_targets_for_channel([agent_name], channel, sender)
     for target in targets:
         if agents.is_available(target):
             await agents.trigger(target, message=message, channel=channel, prompt=custom_prompt)
@@ -1936,13 +2410,7 @@ async def post_job_message(job_id: int, request: Request):
     if job:
         channel = job.get("channel", "general")
         raw_targets = router.get_targets(sender, text, channel)
-        targets = []
-        for t in raw_targets:
-            if registry:
-                targets.extend(registry.resolve_to_instances(t))
-            else:
-                targets.append(t)
-        targets = list(dict.fromkeys(targets))
+        targets = resolve_targets_for_channel(raw_targets, channel, sender)
 
         import mcp_bridge
         chat_msg = f"{sender}: {text}" if text else ""
@@ -2091,6 +2559,7 @@ async def register_agent(request: Request):
     result = registry.register(base, label)
     if result is None:
         return JSONResponse({"error": f"unknown base: {base}"}, status_code=400)
+    usage_snapshots.pop(result["name"], None)
     # Touch presence so the instance doesn't immediately time out
     import mcp_bridge
     with mcp_bridge._presence_lock:
@@ -2120,6 +2589,71 @@ async def register_agent(request: Request):
     return JSONResponse(result)
 
 
+@app.post("/api/terminal_event")
+async def terminal_event(request: Request):
+    """Wrapper reports terminal-only prompts so detached users see them in chat."""
+    auth_inst = _resolve_authenticated_agent(request)
+    if not auth_inst:
+        return JSONResponse({"error": "authenticated agent session required"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    kind = str(body.get("kind", "terminal")).strip().lower()
+    text = str(body.get("text", "")).strip()
+    if not text:
+        return JSONResponse({"ok": True, "ignored": True})
+    if len(text) > 800:
+        text = text[-800:]
+
+    agent_name = auth_inst.get("name", "agent")
+    if kind == "permission":
+        message = (
+            f"{agent_name} may be waiting for a terminal permission prompt. "
+            f"Reattach with: tmux attach -t agentchattr-{agent_name}\n{text}"
+        )
+    else:
+        message = f"{agent_name} terminal notice:\n{text}"
+    store.add("system", message, msg_type="system", channel=_last_active_channel)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/usage_event")
+async def usage_event(request: Request):
+    """Wrapper reports provider token usage without exposing transcript text."""
+    auth_inst = _resolve_authenticated_agent(request)
+    if not auth_inst:
+        return JSONResponse({"error": "authenticated agent session required"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    status = str(body.get("status", "unavailable")).strip().lower()
+    provider = str(auth_inst.get("base", "")).strip().lower()
+    snapshot = {
+        "status": "ok" if status == "ok" else "unavailable",
+        "provider": provider,
+        "updated_at": int(body.get("updated_at", 0) or 0),
+    }
+    if snapshot["status"] == "ok":
+        used_tokens = body.get("used_tokens")
+        if not isinstance(used_tokens, int) or isinstance(used_tokens, bool) or used_tokens < 0:
+            return JSONResponse({"error": "used_tokens must be a non-negative integer"}, status_code=400)
+        snapshot["used_tokens"] = used_tokens
+        details = body.get("details", {})
+        if isinstance(details, dict):
+            snapshot["details"] = {k: v for k, v in details.items() if isinstance(v, int) and not isinstance(v, bool) and v >= 0}
+    else:
+        reason = str(body.get("reason", "usage unavailable")).strip()
+        snapshot["reason"] = reason[:160]
+
+    usage_snapshots[auth_inst["name"]] = snapshot
+    if _event_loop:
+        asyncio.run_coroutine_threadsafe(broadcast_status(), _event_loop)
+    return JSONResponse({"ok": True})
+
+
 @app.post("/api/deregister/{name}")
 async def deregister_agent(name: str, request: Request):
     """Wrapper calls this on shutdown to remove its instance."""
@@ -2135,6 +2669,7 @@ async def deregister_agent(name: str, request: Request):
     result = registry.deregister(name)
     if result is None:
         return JSONResponse({"error": "not found"}, status_code=404)
+    usage_snapshots.pop(name, None)
     # Clean up runtime state (presence, activity, cursors, rename chains)
     import mcp_bridge
     mcp_bridge.purge_identity(name)
@@ -2183,6 +2718,8 @@ async def rename_agent_label(name: str, request: Request):
             return JSONResponse({"ok": True, "warning": result})
         return JSONResponse({"error": result}, status_code=400)
 
+    usage_snapshots.pop(name, None)
+    usage_snapshots.pop(new_id, None)
     import mcp_bridge
     mcp_bridge.migrate_identity(name, new_id)
     # Update sender on all historical messages

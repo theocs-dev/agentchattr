@@ -20,10 +20,13 @@ How it works:
 
 import json
 import os
+import re
 import shutil
 import sys
 import threading
 import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).parent
@@ -360,10 +363,361 @@ def _build_provider_launch(
         token=token, mcp_cfg=mcp_cfg, project_dir=project_dir,
     )
 
-    launch_args = [*mcp_args, *extra_args]
+    profile_args = _build_profile_args(agent, agent_cfg, data_dir)
+    launch_args = [*mcp_args, *profile_args, *extra_args]
     launch_env = dict(env)
 
     return launch_args, launch_env, inject_env, settings_path
+
+
+def _load_room_settings(data_dir: Path) -> dict:
+    settings_path = data_dir / "settings.json"
+    if not settings_path.exists():
+        return {}
+    try:
+        return json.loads(settings_path.read_text("utf-8"))
+    except Exception:
+        return {}
+
+
+def _selected_profile(agent: str, agent_cfg: dict, data_dir: Path) -> tuple[str, dict] | tuple[None, None]:
+    profiles = agent_cfg.get("profiles", {})
+    if not isinstance(profiles, dict) or not profiles:
+        return None, None
+    selected = None
+    settings = _load_room_settings(data_dir)
+    agent_profiles = settings.get("agent_profiles", {})
+    if isinstance(agent_profiles, dict):
+        selected = agent_profiles.get(agent)
+    if selected not in profiles:
+        for name, profile in profiles.items():
+            if isinstance(profile, dict) and profile.get("default"):
+                selected = name
+                break
+    if selected not in profiles:
+        selected = next(iter(profiles), None)
+    if not selected:
+        return None, None
+    return selected, profiles[selected]
+
+
+def _claude_fast_mode_enabled(agent_cfg: dict, profile: dict, settings: dict) -> bool:
+    agent_fast_modes = settings.get("agent_fast_modes", {})
+    if isinstance(agent_fast_modes, dict) and "claude" in agent_fast_modes:
+        return bool(agent_fast_modes.get("claude"))
+    if "fast_mode_default" in agent_cfg:
+        return bool(agent_cfg.get("fast_mode_default"))
+    return bool(profile.get("fast_mode", False))
+
+
+def _set_inline_claude_setting(args: list[str], key: str, value) -> None:
+    for idx, arg in enumerate(args[:-1]):
+        if arg != "--settings":
+            continue
+        try:
+            settings = json.loads(args[idx + 1])
+        except Exception:
+            continue
+        if not isinstance(settings, dict):
+            continue
+        settings[key] = value
+        args[idx + 1] = json.dumps(settings, separators=(",", ":"))
+        return
+    args.extend(["--settings", json.dumps({key: value}, separators=(",", ":"))])
+
+
+def _build_profile_args(agent: str, agent_cfg: dict, data_dir: Path) -> list[str]:
+    selected, profile = _selected_profile(agent, agent_cfg, data_dir)
+    if not profile:
+        return []
+    settings = _load_room_settings(data_dir)
+    args: list[str] = []
+    model = str(profile.get("model", "")).strip()
+    reasoning = str(profile.get("reasoning", "")).strip()
+    explicit_args = profile.get("args", [])
+    if model:
+        args.extend(["--model", model])
+    if agent == "claude" and reasoning:
+        args.extend(["--effort", reasoning])
+    elif agent == "codex" and reasoning:
+        args.extend(["-c", f'model_reasoning_effort="{reasoning}"'])
+    if isinstance(explicit_args, list):
+        args.extend(str(a) for a in explicit_args)
+    if agent == "claude":
+        _set_inline_claude_setting(args, "fastMode", _claude_fast_mode_enabled(agent_cfg, profile, settings))
+    if agent == "claude" and not any(str(a).startswith("--session-id") for a in args):
+        args.extend(["--session-id", str(uuid.uuid4())])
+    if selected:
+        label = profile.get("label", selected)
+        print(f"  Profile: {label} ({selected})")
+    return args
+
+
+def _profile_claude_session_id(args: list[str]) -> str | None:
+    for idx, value in enumerate(args):
+        if value == "--session-id" and idx + 1 < len(args):
+            return args[idx + 1]
+    return None
+
+
+def _safe_int(value) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value if value >= 0 else 0
+    return 0
+
+
+def _usage_unavailable(provider: str, reason: str) -> dict:
+    return {
+        "provider": provider,
+        "status": "unavailable",
+        "reason": reason,
+        "updated_at": int(time.time()),
+    }
+
+
+def _tail_lines(path: Path, max_bytes: int = 1024 * 1024) -> list[str]:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes))
+            data = handle.read()
+    except OSError:
+        return []
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
+def _head_lines(path: Path, max_bytes: int = 128 * 1024) -> list[str]:
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(max_bytes)
+    except OSError:
+        return []
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
+def _usage_payload(provider: str, used_tokens: int, details: dict | None = None) -> dict:
+    payload = {
+        "provider": provider,
+        "status": "ok",
+        "used_tokens": used_tokens,
+        "updated_at": int(time.time()),
+    }
+    if details:
+        payload["details"] = {k: v for k, v in details.items() if isinstance(v, int)}
+    return payload
+
+
+def _parse_claude_usage_lines(lines: list[str]) -> dict | None:
+    latest: dict | None = None
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        usage = event.get("message", {}).get("usage", {}) if isinstance(event, dict) else {}
+        if not isinstance(usage, dict):
+            continue
+        input_tokens = _safe_int(usage.get("input_tokens"))
+        cache_creation = _safe_int(usage.get("cache_creation_input_tokens"))
+        cache_read = _safe_int(usage.get("cache_read_input_tokens"))
+        if input_tokens or cache_creation or cache_read:
+            latest = _usage_payload(
+                "claude",
+                input_tokens + cache_creation + cache_read,
+                {
+                    "input_tokens": input_tokens,
+                    "cache_creation_input_tokens": cache_creation,
+                    "cache_read_input_tokens": cache_read,
+                },
+            )
+    return latest
+
+
+def _parse_codex_usage_lines(lines: list[str]) -> dict | None:
+    latest: dict | None = None
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(event, dict):
+            continue
+        payload = event.get("payload", {})
+        if event.get("type") != "event_msg" or not isinstance(payload, dict):
+            continue
+        if payload.get("type") != "token_count":
+            continue
+        info = payload.get("info", {})
+        if not isinstance(info, dict):
+            continue
+        usage = info.get("last_token_usage", {})
+        if not isinstance(usage, dict):
+            continue
+        input_tokens = _safe_int(usage.get("input_tokens"))
+        if input_tokens:
+            latest = _usage_payload(
+                "codex",
+                input_tokens,
+                {
+                    "input_tokens": input_tokens,
+                    "cached_input_tokens": _safe_int(usage.get("cached_input_tokens")),
+                },
+            )
+    return latest
+
+
+def _parse_codex_session_meta(lines: list[str]) -> dict | None:
+    for line in lines[:20]:
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(event, dict) and event.get("type") == "session_meta":
+            payload = event.get("payload", {})
+            if not isinstance(payload, dict):
+                return None
+            meta = dict(payload)
+            event_timestamp = event.get("timestamp")
+            if isinstance(event_timestamp, str):
+                meta.setdefault("_event_timestamp", event_timestamp)
+            return meta
+    return None
+
+
+def _parse_iso_timestamp(value) -> float | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _codex_session_started_at(meta: dict) -> float | None:
+    return _parse_iso_timestamp(meta.get("timestamp")) or _parse_iso_timestamp(meta.get("_event_timestamp"))
+
+
+def _is_codex_user_session(meta: dict) -> bool:
+    source = meta.get("source")
+    if isinstance(source, dict) and "subagent" in source:
+        return False
+    thread_source = meta.get("thread_source")
+    if isinstance(thread_source, str) and thread_source and thread_source != "user":
+        return False
+    return True
+
+
+def _default_codex_roots() -> list[Path]:
+    home = Path.home()
+    return [home / ".codex" / "sessions", home / ".codex" / "archived_sessions"]
+
+
+def _find_codex_rollout_file(project_dir: Path, started_at: float, roots: list[Path] | None = None) -> Path | None:
+    roots = roots or _default_codex_roots()
+    target_cwd = str(project_dir)
+    min_session_started_at = started_at - 5
+    candidates: list[Path] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            paths = root.rglob("rollout-*.jsonl") if root.is_dir() else []
+            for path in paths:
+                try:
+                    if path.stat().st_mtime < started_at - 60:
+                        continue
+                except OSError:
+                    continue
+                meta = _parse_codex_session_meta(_head_lines(path))
+                if not meta or meta.get("cwd") != target_cwd:
+                    continue
+                if not _is_codex_user_session(meta):
+                    continue
+                session_started_at = _codex_session_started_at(meta)
+                if session_started_at is None or session_started_at < min_session_started_at:
+                    continue
+                candidates.append(path)
+        except OSError:
+            continue
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
+def _find_claude_session_file(session_id: str, roots: list[Path] | None = None) -> Path | None:
+    roots = roots or [Path.home() / ".claude" / "projects"]
+    matches: list[Path] = []
+    expected = f"{session_id}.jsonl"
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            matches.extend(path for path in root.rglob(expected) if path.name == expected)
+        except OSError:
+            continue
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _report_usage_event(server_port: int, token: str, payload: dict) -> None:
+    try:
+        import urllib.request
+        body = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{server_port}/api/usage_event",
+            method="POST",
+            data=body,
+            headers=_auth_headers(token, include_json=True),
+        )
+        urllib.request.urlopen(req, timeout=3)
+    except Exception:
+        pass
+
+
+def _usage_monitor(agent: str, project_dir: Path, server_port: int, get_token_fn,
+                   *, claude_session_id: str | None = None, started_at: float | None = None):
+    source_path: Path | None = None
+    last_sent = ""
+    reported_unavailable = False
+    started_at = started_at or time.time()
+    while True:
+        time.sleep(5)
+        payload = None
+        if agent == "claude":
+            if source_path is None and claude_session_id:
+                source_path = _find_claude_session_file(claude_session_id)
+            if source_path:
+                payload = _parse_claude_usage_lines(_tail_lines(source_path))
+            elif not reported_unavailable:
+                payload = _usage_unavailable("claude", "session jsonl not found")
+                reported_unavailable = True
+        elif agent == "codex":
+            if source_path is None:
+                source_path = _find_codex_rollout_file(project_dir, started_at)
+                if source_path is None and not reported_unavailable:
+                    payload = _usage_unavailable("codex", "rollout correlation ambiguous or missing")
+                    reported_unavailable = True
+            if source_path:
+                payload = _parse_codex_usage_lines(_tail_lines(source_path))
+        if not payload:
+            continue
+        serialized = json.dumps(payload, sort_keys=True)
+        if serialized == last_sent:
+            continue
+        last_sent = serialized
+        _report_usage_event(server_port, get_token_fn(), payload)
 
 
 def _register_instance(server_port: int, base: str, label: str | None = None) -> dict:
@@ -449,6 +803,77 @@ def _report_rule_sync(server_port: int, agent_name: str, epoch: int, token: str 
         urllib.request.urlopen(req, timeout=3)
     except Exception:
         pass
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_PERMISSION_PROMPTS = (
+    re.compile(r"\[(?:y/n|yes/no|y/N|Y/n)\]", re.IGNORECASE),
+    re.compile(r"\((?:y/n|yes/no|y/N|Y/n)\)", re.IGNORECASE),
+    re.compile(r"\bdo you want to\b.*\?", re.IGNORECASE),
+    re.compile(r"\bapprove\b(?=[^\n?]{0,80}\b(?:command|tool|execution|access|operation|action|request)\b)[^\n?]{0,80}\?", re.IGNORECASE),
+    re.compile(r"\ballow\b(?=[^\n?]{0,80}\b(?:command|tool|execution|access|operation|action|request|read|write|network)\b)[^\n?]{0,80}\?", re.IGNORECASE),
+    re.compile(r"\b(?:approve|allow)\?", re.IGNORECASE),
+    re.compile(r"\b(?:yes,? and don'?t ask again|always allow)\b", re.IGNORECASE),
+)
+
+
+def _terminal_tail(text: str, max_lines: int = 12) -> str:
+    clean = _ANSI_RE.sub("", text)
+    lines = [line.strip() for line in clean.splitlines() if line.strip()]
+    return "\n".join(lines[-max_lines:])
+
+
+def _looks_like_permission_prompt(text: str) -> bool:
+    tail = _terminal_tail(text)
+    if not tail:
+        return False
+    return any(pattern.search(tail) for pattern in _PERMISSION_PROMPTS)
+
+
+def _report_terminal_event(server_port: int, token: str, kind: str, text: str) -> None:
+    try:
+        import urllib.request
+        body = json.dumps({"kind": kind, "text": text}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{server_port}/api/terminal_event",
+            method="POST",
+            data=body,
+            headers=_auth_headers(token, include_json=True),
+        )
+        urllib.request.urlopen(req, timeout=3)
+    except Exception:
+        pass
+
+
+def _terminal_permission_monitor(session_name: str, server_port: int, get_token_fn):
+    """Watch detached tmux panes for likely permission prompts and mirror them to chat."""
+    import subprocess
+
+    last_notice = ""
+    last_notice_at = 0.0
+    while True:
+        time.sleep(2)
+        try:
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-t", session_name, "-p", "-S", "-30"],
+                capture_output=True,
+                timeout=2,
+            )
+            if result.returncode != 0:
+                continue
+            text = result.stdout.decode("utf-8", errors="replace").strip()
+            if not text or not _looks_like_permission_prompt(text):
+                continue
+            snippet = "\n".join(line for line in text.splitlines()[-12:] if line.strip())
+            now = time.time()
+            dedupe_key = str(hash(snippet))
+            if dedupe_key == last_notice and now - last_notice_at < 60:
+                continue
+            last_notice = dedupe_key
+            last_notice_at = now
+            _report_terminal_event(server_port, get_token_fn(), "permission", snippet)
+        except Exception:
+            continue
 
 
 def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = False, trigger_flag=None,
@@ -575,6 +1000,7 @@ def main():
     parser.add_argument("agent", choices=agent_names, help=f"Agent to wrap ({', '.join(agent_names)})")
     parser.add_argument("--no-restart", action="store_true", help="Do not restart on exit")
     parser.add_argument("--label", type=str, default=None, help="Custom display label")
+    parser.add_argument("--cwd", type=str, default=None, help="Override the agent working directory")
     # Per-project isolation flags (must match the server's flags so wrappers
     # launched separately connect to the right instance). Values are consumed
     # by apply_cli_overrides() above; listing here so --help shows them.
@@ -587,7 +1013,7 @@ def main():
 
     agent = args.agent
     agent_cfg = config.get("agents", {}).get(agent, {})
-    cwd = agent_cfg.get("cwd", ".")
+    cwd = args.cwd or agent_cfg.get("cwd", ".")
     command = agent_cfg.get("command", agent)
     data_dir = ROOT / config.get("server", {}).get("data_dir", "./data")
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -859,6 +1285,17 @@ def main():
 
     threading.Thread(target=_activity_monitor, daemon=True).start()
 
+    if agent in {"claude", "codex"}:
+        threading.Thread(
+            target=_usage_monitor,
+            args=(agent, project_dir, server_port, get_token),
+            kwargs={
+                "claude_session_id": _profile_claude_session_id(launch_args),
+                "started_at": time.time(),
+            },
+            daemon=True,
+        ).start()
+
     _agent_pid = [None]
 
     if sys.platform == "win32":
@@ -870,6 +1307,11 @@ def main():
 
         unix_session_name = f"agentchattr-{assigned_name}"
         _set_activity_checker(get_activity_checker(unix_session_name, trigger_flag=_trigger_flag))
+        threading.Thread(
+            target=_terminal_permission_monitor,
+            args=(unix_session_name, server_port, get_token),
+            daemon=True,
+        ).start()
 
     run_kwargs = dict(
         command=command,

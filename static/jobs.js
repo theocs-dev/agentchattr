@@ -36,6 +36,7 @@ let _draggedJobStatus = null;
 let _pendingJobReflowTops = null;
 let _pendingJobReflowTimer = null;
 const _expandedGroups = new Set(['open']); // track which collapsible groups are open across re-renders
+const JOB_MENTION_NAME_SOURCE = String.raw`[\p{L}\p{N}_][\p{L}\p{N}\p{M}_-]*`;
 
 // ---------------------------------------------------------------------------
 // Message Renderers
@@ -251,7 +252,7 @@ function _extractJobMentionTargets(text) {
     const byLower = {};
     for (const o of opts) byLower[o.name.toLowerCase()] = o.name;
     const hits = [];
-    const re = /@([a-zA-Z][\w-]*)/g;
+    const re = new RegExp(`@(${JOB_MENTION_NAME_SOURCE})`, 'gu');
     let m;
     while ((m = re.exec(text)) !== null) {
         const key = m[1].toLowerCase();
@@ -2016,9 +2017,13 @@ function updateJobMentionMenu() {
     const query = text.slice(atPos + 1, cursor).toLowerCase();
     jobMentionStart = atPos;
 
-    const candidates = window.getMentionCandidates();
+    const job = jobsData.find(a => a.id === activeJobId);
+    const candidates = window.getMentionCandidates(job?.channel || window.activeChannel);
     const matches = candidates.filter(c =>
-        c.name.toLowerCase().includes(query) || c.label.toLowerCase().includes(query)
+        c.name.toLowerCase().includes(query)
+        || c.label.toLowerCase().includes(query)
+        || (c.handle || '').toLowerCase().includes(query)
+        || (c.aliasTarget || '').toLowerCase().includes(query)
     );
 
     if (matches.length === 0) {
@@ -2034,7 +2039,7 @@ function updateJobMentionMenu() {
         const row = document.createElement('div');
         row.className = 'mention-item' + (i === jobMentionIndex ? ' active' : '');
         row.dataset.name = item.name;
-        row.innerHTML = `<span class="mention-dot" style="background: ${item.color}"></span><span class="mention-name">${window.escapeHtml(item.label)}</span>`;
+        row.innerHTML = `<span class="mention-dot" style="background: ${item.color}"></span><span class="mention-name"><span>${window.escapeHtml(item.label)}</span><span class="mention-handle">&middot; ${window.escapeHtml(item.handle || '@' + item.name)}</span></span>`;
         row.addEventListener('mousedown', (e) => {
             e.preventDefault();
             selectJobMention(item.name);

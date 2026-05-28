@@ -30,20 +30,49 @@ class Router:
         self._mention_re = re.compile(
             rf"@({alternatives})(?![\w-])", re.IGNORECASE
         )
+        self._leading_mention_re = re.compile(
+            rf"(?:^|\n)\s*(?:@(?:{alternatives})(?![\w-])(?:[\s,;:]+|$))+",
+            re.IGNORECASE,
+        )
+
+    def _all_targets(self) -> list[str]:
+        if self._online_checker:
+            online = self._online_checker()
+            return sorted(n for n in self.agent_names if n in online)
+        return sorted(self.agent_names)
+
+    def _strip_code(self, text: str) -> str:
+        """Remove Markdown code blocks and inline code before mention routing."""
+        text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+        return re.sub(r"`[^`\n]*`", "", text)
 
     def parse_mentions(self, text: str) -> list[str]:
         mentions = set()
-        for match in self._mention_re.finditer(text):
+        for match in self._mention_re.finditer(self._strip_code(text)):
             name = match.group(1).lower()
             if name in ("both", "all"):
                 # Only tag online agents when using @all
-                if self._online_checker:
-                    online = self._online_checker()
-                    mentions.update(n for n in self.agent_names if n in online)
-                else:
-                    mentions.update(self.agent_names)
+                mentions.update(self._all_targets())
             else:
                 mentions.add(name)
+        return list(mentions)
+
+    def parse_leading_mentions(self, text: str) -> list[str]:
+        """Parse only mentions at the start of a message or line.
+
+        Agent messages often include examples like `@codex do X`. Those should
+        not wake agents unless the agent intentionally starts a handoff line
+        with the mention.
+        """
+        mentions = set()
+        stripped = self._strip_code(text)
+        for lead in self._leading_mention_re.finditer(stripped):
+            for match in self._mention_re.finditer(lead.group(0)):
+                name = match.group(1).lower()
+                if name in ("both", "all"):
+                    mentions.update(self._all_targets())
+                else:
+                    mentions.add(name)
         return list(mentions)
 
     def _is_agent(self, sender: str) -> bool:
@@ -60,8 +89,12 @@ class Router:
             ch["paused"] = False
             ch["guard_emitted"] = False
             if not mentions:
+                # Slash-prefixed text is command-shaped. Unknown commands should
+                # not fan out through the default target accidentally.
+                if text.lstrip().startswith("/"):
+                    return []
                 if self.default_mention in ("both", "all"):
-                    return list(self.agent_names)
+                    return self._all_targets()
                 elif self.default_mention == "none":
                     return []
                 return [self.default_mention]
@@ -70,6 +103,7 @@ class Router:
             # Agent message: blocked while loop guard is active
             if ch["paused"]:
                 return []
+            mentions = self.parse_leading_mentions(text)
             # Only route if explicit @mention
             if not mentions:
                 return []

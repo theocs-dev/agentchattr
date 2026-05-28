@@ -257,6 +257,43 @@ header h1 {
     transition: background 0.3s;
 }
 
+.status-body {
+    display: grid;
+    grid-template-columns: minmax(72px, max-content);
+    gap: 1px;
+    min-width: 92px;
+}
+
+.status-label {
+    line-height: 1.15;
+    font-weight: 650;
+}
+
+.status-meta,
+.token-meter-label {
+    color: var(--text-dim);
+    font-size: 10px;
+    line-height: 1.1;
+}
+
+.token-meter {
+    height: 3px;
+    width: 100%;
+    border-radius: var(--radius-full);
+    background: color-mix(in srgb, var(--agent-color, #4ade80) 15%, var(--bg-input));
+    overflow: hidden;
+    margin-top: 2px;
+}
+
+.token-meter-fill {
+    display: block;
+    height: 100%;
+    width: 0%;
+    border-radius: inherit;
+    background: var(--agent-color, #4ade80);
+    transition: width 0.2s ease;
+}
+
 .status-pill.available .status-dot { background: var(--online); }
 .status-pill.offline .status-dot { background: #555; }
 
@@ -428,6 +465,47 @@ header h1 {
 .settings-field input:disabled {
     opacity: 0.35;
     pointer-events: none;
+}
+
+.settings-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text);
+    cursor: pointer;
+    font-size: 13px;
+    user-select: none;
+}
+
+.settings-field .settings-check input[type="checkbox"] {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    border: 1.5px solid var(--border-strong);
+    border-radius: 4px;
+    background: var(--bg-input);
+    cursor: pointer;
+    position: relative;
+    flex-shrink: 0;
+}
+
+.settings-field .settings-check input[type="checkbox"]:checked {
+    background: var(--accent);
+    border-color: var(--accent);
+}
+
+.settings-field .settings-check input[type="checkbox"]:checked::after {
+    content: '';
+    position: absolute;
+    left: 4px;
+    top: 1px;
+    width: 5px;
+    height: 9px;
+    border: solid white;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
 }
 
 /* --- Sound settings --- */
@@ -2267,6 +2345,7 @@ body.channels-in-sidebar #channel-bar {
     justify-content: center;
     overflow-wrap: break-word;
     text-align: center;
+    white-space: pre-wrap;
 }
 
 /* Proposal cards */
@@ -3842,9 +3921,18 @@ footer {
 }
 
 .mention-name {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+    align-items: baseline;
     font-weight: 600;
     font-size: 13px;
     color: var(--text);
+}
+
+.mention-handle {
+    color: var(--text-dim);
+    font-weight: 500;
 }
 
 /* --- Dropzone --- */
