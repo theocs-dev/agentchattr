@@ -370,20 +370,25 @@ def _build_provider_launch(
     return launch_args, launch_env, inject_env, settings_path
 
 
+def _load_room_settings(data_dir: Path) -> dict:
+    settings_path = data_dir / "settings.json"
+    if not settings_path.exists():
+        return {}
+    try:
+        return json.loads(settings_path.read_text("utf-8"))
+    except Exception:
+        return {}
+
+
 def _selected_profile(agent: str, agent_cfg: dict, data_dir: Path) -> tuple[str, dict] | tuple[None, None]:
     profiles = agent_cfg.get("profiles", {})
     if not isinstance(profiles, dict) or not profiles:
         return None, None
     selected = None
-    settings_path = data_dir / "settings.json"
-    if settings_path.exists():
-        try:
-            settings = json.loads(settings_path.read_text("utf-8"))
-            agent_profiles = settings.get("agent_profiles", {})
-            if isinstance(agent_profiles, dict):
-                selected = agent_profiles.get(agent)
-        except Exception:
-            selected = None
+    settings = _load_room_settings(data_dir)
+    agent_profiles = settings.get("agent_profiles", {})
+    if isinstance(agent_profiles, dict):
+        selected = agent_profiles.get(agent)
     if selected not in profiles:
         for name, profile in profiles.items():
             if isinstance(profile, dict) and profile.get("default"):
@@ -396,10 +401,36 @@ def _selected_profile(agent: str, agent_cfg: dict, data_dir: Path) -> tuple[str,
     return selected, profiles[selected]
 
 
+def _claude_fast_mode_enabled(agent_cfg: dict, profile: dict, settings: dict) -> bool:
+    agent_fast_modes = settings.get("agent_fast_modes", {})
+    if isinstance(agent_fast_modes, dict) and "claude" in agent_fast_modes:
+        return bool(agent_fast_modes.get("claude"))
+    if "fast_mode_default" in agent_cfg:
+        return bool(agent_cfg.get("fast_mode_default"))
+    return bool(profile.get("fast_mode", False))
+
+
+def _set_inline_claude_setting(args: list[str], key: str, value) -> None:
+    for idx, arg in enumerate(args[:-1]):
+        if arg != "--settings":
+            continue
+        try:
+            settings = json.loads(args[idx + 1])
+        except Exception:
+            continue
+        if not isinstance(settings, dict):
+            continue
+        settings[key] = value
+        args[idx + 1] = json.dumps(settings, separators=(",", ":"))
+        return
+    args.extend(["--settings", json.dumps({key: value}, separators=(",", ":"))])
+
+
 def _build_profile_args(agent: str, agent_cfg: dict, data_dir: Path) -> list[str]:
     selected, profile = _selected_profile(agent, agent_cfg, data_dir)
     if not profile:
         return []
+    settings = _load_room_settings(data_dir)
     args: list[str] = []
     model = str(profile.get("model", "")).strip()
     reasoning = str(profile.get("reasoning", "")).strip()
@@ -412,6 +443,8 @@ def _build_profile_args(agent: str, agent_cfg: dict, data_dir: Path) -> list[str
         args.extend(["-c", f'model_reasoning_effort="{reasoning}"'])
     if isinstance(explicit_args, list):
         args.extend(str(a) for a in explicit_args)
+    if agent == "claude":
+        _set_inline_claude_setting(args, "fastMode", _claude_fast_mode_enabled(agent_cfg, profile, settings))
     if agent == "claude" and not any(str(a).startswith("--session-id") for a in args):
         args.extend(["--session-id", str(uuid.uuid4())])
     if selected:

@@ -61,6 +61,31 @@ class RouterMentionTests(unittest.TestCase):
             ["codex"],
         )
 
+    def test_default_all_matches_online_all_semantics(self):
+        router = Router(
+            ["claude", "codex", "gemini"],
+            default_mention="all",
+            online_checker=lambda: {"claude", "gemini"},
+        )
+
+        self.assertEqual(router.get_targets("ben", "please check"), ["claude", "gemini"])
+
+    def test_default_specific_agent_routes_without_explicit_mention(self):
+        router = Router(["claude", "codex"], default_mention="codex")
+
+        self.assertEqual(router.get_targets("ben", "please check"), ["codex"])
+
+    def test_explicit_mention_overrides_default_agent(self):
+        router = Router(["claude", "codex"], default_mention="codex")
+
+        self.assertEqual(router.get_targets("ben", "@claude please check"), ["claude"])
+
+    def test_unknown_slash_command_does_not_use_default_route(self):
+        router = Router(["claude", "codex"], default_mention="all")
+
+        self.assertEqual(router.get_targets("ben", "/unknown"), [])
+        self.assertEqual(router.get_targets("ben", "@codex /unknown"), ["codex"])
+
 
 if __name__ == "__main__":
     unittest.main()

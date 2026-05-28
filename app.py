@@ -46,6 +46,7 @@ ws_clients: set[WebSocket] = set()
 usage_snapshots: dict[str, dict] = {}
 _target_resolution_warning_times: dict[tuple, float] = {}
 _TARGET_RESOLUTION_WARNING_TTL = 30
+_DEFAULT_MENTION_TARGET_RE = _re.compile(r"^[\w-]{1,64}$", _re.UNICODE)
 
 # --- Security: session token (set by configure()) ---
 session_token: str = ""
@@ -58,8 +59,10 @@ room_settings: dict = {
     "channels": ["general"],
     "history_limit": "all",
     "contrast": "normal",
+    "default_mention": "all",
     "custom_roles": [],
     "agent_profiles": {},
+    "agent_fast_modes": {},
 }
 
 # Channel validation
@@ -129,6 +132,33 @@ def _settings_path() -> Path:
     return Path(data_dir) / "settings.json"
 
 
+def _normalize_default_mention(value, fallback: str = "all") -> str:
+    if not isinstance(value, str):
+        return fallback
+    target = value.strip().lower()
+    if target.startswith("@"):
+        target = target[1:]
+    if target == "both":
+        target = "all"
+    if target in {"all", "none"}:
+        return target
+    if _DEFAULT_MENTION_TARGET_RE.match(target):
+        return target
+    return fallback
+
+
+def _configured_default_mention() -> str:
+    raw = room_settings.get("default_mention")
+    if raw is None:
+        raw = config.get("routing", {}).get("default", "all")
+    return _normalize_default_mention(raw, fallback="all")
+
+
+def _apply_default_mention_to_router() -> None:
+    if router:
+        router.default_mention = _configured_default_mention()
+
+
 def _load_settings():
     global room_settings
     p = _settings_path()
@@ -145,12 +175,17 @@ def _load_settings():
         room_settings["channels"].insert(0, "general")
     if not isinstance(room_settings.get("agent_profiles"), dict):
         room_settings["agent_profiles"] = {}
+    if not isinstance(room_settings.get("agent_fast_modes"), dict):
+        room_settings["agent_fast_modes"] = {}
+    room_settings["default_mention"] = _configured_default_mention()
     for base, cfg in config.get("agents", {}).items():
         profiles = cfg.get("profiles", {})
         if isinstance(profiles, dict) and profiles:
             selected = room_settings["agent_profiles"].get(base)
             if selected not in profiles:
                 room_settings["agent_profiles"][base] = _default_profile_name(base)
+        if _fast_mode_supported(base) and base not in room_settings["agent_fast_modes"]:
+            room_settings["agent_fast_modes"][base] = _default_fast_mode_enabled(base)
 
 
 def _save_settings():
@@ -195,6 +230,35 @@ def _public_profile(profile: dict) -> dict:
     }
 
 
+def _fast_mode_supported(base: str) -> bool:
+    return base == "claude" and base in config.get("agents", {})
+
+
+def _default_fast_mode_enabled(base: str) -> bool:
+    agent_cfg = config.get("agents", {}).get(base, {})
+    if "fast_mode_default" in agent_cfg:
+        return bool(agent_cfg.get("fast_mode_default"))
+    profiles = _profile_catalog_for(base)
+    default_profile = profiles.get(_default_profile_name(base), {})
+    return bool(default_profile.get("fast_mode", False)) if isinstance(default_profile, dict) else False
+
+
+def _selected_fast_mode_enabled(base: str) -> bool:
+    if not _fast_mode_supported(base):
+        return False
+    selected = room_settings.get("agent_fast_modes", {})
+    if isinstance(selected, dict) and base in selected:
+        return bool(selected.get(base))
+    return _default_fast_mode_enabled(base)
+
+
+def _fast_mode_payload_for(base: str) -> dict:
+    return {
+        "supported": _fast_mode_supported(base),
+        "enabled": _selected_fast_mode_enabled(base),
+    }
+
+
 def _profile_payload_for(base: str) -> dict:
     profiles = _profile_catalog_for(base)
     selected = _selected_profile_name(base)
@@ -214,6 +278,7 @@ def _agent_config_for_client() -> dict:
         base = info.get("base", "")
         if base:
             info["profile"] = _profile_payload_for(base)
+            info["fast_mode"] = _fast_mode_payload_for(base)
     return agent_cfg
 
 
@@ -459,6 +524,7 @@ def configure(cfg: dict, session_token: str = ""):
     store.on_message(_on_store_message)
 
     _load_settings()
+    _apply_default_mention_to_router()
     _load_hats()
 
     # Apply saved loop guard setting
@@ -1040,6 +1106,9 @@ def _format_profile_list(base: str) -> str:
     if not profiles:
         return f"{base}: no profiles configured"
     parts = []
+    if _fast_mode_supported(base):
+        state = "ON" if _selected_fast_mode_enabled(base) else "OFF"
+        parts.append(f"{base} fast mode: {state}")
     for name, profile in profiles.items():
         marker = "*" if name == payload.get("selected") else "-"
         label = profile.get("label") or name
@@ -1102,6 +1171,78 @@ def _set_agent_profile(base: str, profile_name: str) -> str | None:
     return None
 
 
+_FAST_ON_VALUES = {"on", "enable", "enabled", "true", "1", "yes"}
+_FAST_OFF_VALUES = {"off", "disable", "disabled", "false", "0", "no"}
+
+
+def _set_fast_mode(base: str, enabled: bool) -> str | None:
+    if not _fast_mode_supported(base):
+        return f"Fast mode is only configured for Claude."
+    selected = room_settings.setdefault("agent_fast_modes", {})
+    selected[base] = bool(enabled)
+    _save_settings()
+    return None
+
+
+def _format_fast_mode_status(base: str = "claude") -> str:
+    if not _fast_mode_supported(base):
+        return "Fast mode is only configured for Claude."
+    state = "ON" if _selected_fast_mode_enabled(base) else "OFF"
+    return f"{base} fast mode is {state}. Restart the {base} wrapper for terminal flags to change."
+
+
+async def _handle_fast_command(cmd_parts: list[str], channel: str, mentioned_bases: list[str] | None = None) -> None:
+    mentioned_bases = mentioned_bases or []
+    parts = [part.strip() for part in cmd_parts[1:] if part.strip()]
+    base = mentioned_bases[0] if mentioned_bases else "claude"
+
+    if parts and parts[0].startswith("@"):
+        base = parts.pop(0).lower().lstrip("@")
+    elif parts and parts[0].lower() in config.get("agents", {}):
+        base = parts.pop(0).lower()
+
+    if not _fast_mode_supported(base):
+        store.add("system", "Fast mode is only configured for Claude.", msg_type="system", channel=channel)
+        return
+
+    if parts and parts[0].lower() in {"status", "state", "list", "show"}:
+        store.add("system", _format_fast_mode_status(base), msg_type="system", channel=channel)
+        return
+
+    if not parts:
+        enabled = not _selected_fast_mode_enabled(base)
+    else:
+        value = parts[0].lower()
+        if value in _FAST_ON_VALUES:
+            enabled = True
+        elif value in _FAST_OFF_VALUES:
+            enabled = False
+        else:
+            store.add(
+                "system",
+                "Usage: /fast, /fast on, /fast off, /fast status, or @claude /fast off.",
+                msg_type="system",
+                channel=channel,
+            )
+            return
+
+    err = _set_fast_mode(base, enabled)
+    if err:
+        store.add("system", err, msg_type="system", channel=channel)
+        return
+
+    state = "ON" if enabled else "OFF"
+    store.add(
+        "system",
+        f"{base} fast mode set to {state}. Restart the {base} wrapper for this launch setting to take effect.",
+        msg_type="system",
+        channel=channel,
+    )
+    await broadcast_settings()
+    await broadcast_agents()
+    await broadcast_status()
+
+
 async def _handle_model_command(cmd_parts: list[str], channel: str, mentioned_bases: list[str] | None = None) -> None:
     mentioned_bases = mentioned_bases or []
     if len(cmd_parts) == 1:
@@ -1122,7 +1263,7 @@ async def _handle_model_command(cmd_parts: list[str], channel: str, mentioned_ba
     else:
         store.add(
             "system",
-            "Usage: /model claude xhigh, /model codex fast, or @codex /model fast.",
+            "Usage: /model claude max, /model codex xhigh, or @codex /model xhigh.",
             msg_type="system",
             channel=channel,
         )
@@ -1133,9 +1274,10 @@ async def _handle_model_command(cmd_parts: list[str], channel: str, mentioned_ba
         store.add("system", err, msg_type="system", channel=channel)
         return
 
+    resolved_profile_name = room_settings.get("agent_profiles", {}).get(base, profile_name)
     payload = _profile_payload_for(base)
-    profile = payload["profiles"].get(profile_name, {})
-    label = profile.get("label") or profile_name
+    profile = payload["profiles"].get(resolved_profile_name, {})
+    label = profile.get("label") or resolved_profile_name
     store.add(
         "system",
         f"{base} profile set to {label}. Restart the {base} wrapper for this launch profile to take effect.",
@@ -1364,13 +1506,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not text and not attachments:
                     continue
 
-                # Command handling. /model also accepts leading mentions so
-                # "@codex /model fast" is handled locally instead of routed.
+                # Command handling. Local launch-setting commands also accept
+                # leading mentions, e.g. "@codex /model xhigh".
                 leading_mentions, command_text = _leading_mentions_and_command_text(text)
                 addressed_cmd = command_text.split(None, 1)[0].lower() if command_text else ""
-                addressed_model_command = not text.startswith("/") and addressed_cmd == "/model"
-                if text.startswith("/") or addressed_model_command:
-                    cmd_text = command_text if addressed_model_command else text
+                addressed_local_command = not text.startswith("/") and addressed_cmd in {"/model", "/fast"}
+                if text.startswith("/") or addressed_local_command:
+                    cmd_text = command_text if addressed_local_command else text
                     cmd_parts = cmd_text.split()
                     cmd = cmd_parts[0].lower()
                     if cmd == "/clear":
@@ -1386,7 +1528,14 @@ async def websocket_endpoint(websocket: WebSocket):
                         await _handle_model_command(
                             cmd_parts,
                             channel,
-                            _profile_base_from_mentions(leading_mentions) if addressed_model_command else [],
+                            _profile_base_from_mentions(leading_mentions) if addressed_local_command else [],
+                        )
+                        continue
+                    if cmd == "/fast":
+                        await _handle_fast_command(
+                            cmd_parts,
+                            channel,
+                            _profile_base_from_mentions(leading_mentions) if addressed_local_command else [],
                         )
                         continue
                     if cmd in ("/hatmaking", "/artchallenge", "/roastreview", "/poetry"):
@@ -1517,12 +1666,19 @@ async def websocket_endpoint(websocket: WebSocket):
             elif event.get("type") == "update_settings":
                 new = event.get("data", {})
                 changed_profiles = []
+                changed_fast_modes = []
                 if "title" in new and isinstance(new["title"], str):
                     room_settings["title"] = new["title"].strip() or "agentchattr"
                 if "username" in new and isinstance(new["username"], str):
                     room_settings["username"] = new["username"].strip() or "user"
                 if "font" in new and new["font"] in ("mono", "serif", "sans"):
                     room_settings["font"] = new["font"]
+                if "default_mention" in new:
+                    room_settings["default_mention"] = _normalize_default_mention(
+                        new["default_mention"],
+                        fallback=room_settings.get("default_mention", "all"),
+                    )
+                    _apply_default_mention_to_router()
                 if "max_agent_hops" in new:
                     try:
                         hops = int(new["max_agent_hops"])
@@ -1565,6 +1721,18 @@ async def websocket_endpoint(websocket: WebSocket):
                             if selected.get(base) != profile_name:
                                 changed_profiles.append((base, profile_name))
                             selected[base] = profile_name
+                if "agent_fast_modes" in new and isinstance(new["agent_fast_modes"], dict):
+                    selected_fast = room_settings.setdefault("agent_fast_modes", {})
+                    for base, enabled in new["agent_fast_modes"].items():
+                        if not isinstance(base, str):
+                            continue
+                        base = base.strip().lower()
+                        if not _fast_mode_supported(base):
+                            continue
+                        next_enabled = bool(enabled)
+                        if bool(selected_fast.get(base, _default_fast_mode_enabled(base))) != next_enabled:
+                            changed_fast_modes.append((base, next_enabled))
+                        selected_fast[base] = next_enabled
                 _save_settings()
                 await broadcast_settings()
                 await broadcast_agents()
@@ -1575,6 +1743,14 @@ async def websocket_endpoint(websocket: WebSocket):
                     store.add(
                         "system",
                         f"{base} profile set to {label}. Restart the {base} wrapper for this launch profile to take effect.",
+                        msg_type="system",
+                        channel=_last_active_channel,
+                    )
+                for base, enabled in changed_fast_modes:
+                    state = "ON" if enabled else "OFF"
+                    store.add(
+                        "system",
+                        f"{base} fast mode set to {state}. Restart the {base} wrapper for this launch setting to take effect.",
                         msg_type="system",
                         channel=_last_active_channel,
                     )

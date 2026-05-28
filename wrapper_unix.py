@@ -11,11 +11,24 @@ How it works:
   4. Ctrl+B, D to detach (agent keeps running in background)
 """
 
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import time
+import uuid
+
+
+_CLAUDE_THINKING_BLOCK_ERROR_RE = re.compile(
+    r"(?:thinking|redacted_thinking).*blocks.*cannot be modified|"
+    r"blocks.*(?:thinking|redacted_thinking).*cannot be modified",
+    re.IGNORECASE | re.DOTALL,
+)
+_CLAUDE_INTERRUPTED_PROMPT_RE = re.compile(
+    r"Interrupted.*What should Claude do instead\?",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _session_exists(session_name: str) -> bool:
@@ -25,6 +38,43 @@ def _session_exists(session_name: str) -> bool:
         capture_output=True,
     )
     return result.returncode == 0
+
+
+def _capture_pane(session_name: str, start: str = "-45") -> str:
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", session_name, "-p", "-S", start],
+            capture_output=True,
+            timeout=2,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+def _recent_nonempty_lines(text: str, max_lines: int) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return "\n".join(lines[-max_lines:])
+
+
+def _looks_like_claude_thinking_block_error(text: str) -> bool:
+    return bool(text and _CLAUDE_THINKING_BLOCK_ERROR_RE.search(_recent_nonempty_lines(text, 20)))
+
+
+def _looks_like_claude_interrupted_prompt(text: str) -> bool:
+    return bool(text and _CLAUDE_INTERRUPTED_PROMPT_RE.search(_recent_nonempty_lines(text, 8)))
+
+
+def _refresh_claude_session_id(args: list[str]) -> str:
+    next_id = str(uuid.uuid4())
+    for idx, value in enumerate(args[:-1]):
+        if value == "--session-id":
+            args[idx + 1] = next_id
+            return next_id
+    args.extend(["--session-id", next_id])
+    return next_id
 
 
 def _check_tmux():
@@ -37,6 +87,28 @@ def _check_tmux():
     else:
         print("  Install: apt install tmux  (or yum/pacman equivalent)")
     sys.exit(1)
+
+
+def _build_agent_cmd(command, extra_args, strip_env=None, inject_env=None) -> str:
+    agent_cmd = " ".join(
+        [shlex.quote(command)] + [shlex.quote(a) for a in extra_args]
+    )
+
+    # Build env(1) prefix for the command INSIDE the tmux session.
+    # subprocess.run(env=...) only affects the tmux client binary — the
+    # session shell inherits from the tmux server instead.  Use env(1)
+    # to set (-u to unset, VAR=val to inject) vars in the actual session.
+    env_parts = []
+    if strip_env:
+        env_parts.extend(f"-u {shlex.quote(v)}" for v in strip_env)
+    if inject_env:
+        env_parts.extend(
+            f"{shlex.quote(k)}={shlex.quote(v)}"
+            for k, v in inject_env.items()
+        )
+    if env_parts:
+        agent_cmd = f"env {' '.join(env_parts)} {agent_cmd}"
+    return agent_cmd
 
 
 def inject(text: str, *, tmux_session: str, delay: float = 0.3):
@@ -98,31 +170,41 @@ def run_agent(
     _check_tmux()
 
     session_name = session_name or f"agentchattr-{agent}"
-    agent_cmd = " ".join(
-        [shlex.quote(command)] + [shlex.quote(a) for a in extra_args]
-    )
-
-    # Build env(1) prefix for the command INSIDE the tmux session.
-    # subprocess.run(env=...) only affects the tmux client binary — the
-    # session shell inherits from the tmux server instead.  Use env(1)
-    # to set (-u to unset, VAR=val to inject) vars in the actual session.
-    env_parts = []
-    if strip_env:
-        env_parts.extend(f"-u {shlex.quote(v)}" for v in strip_env)
-    if inject_env:
-        env_parts.extend(
-            f"{shlex.quote(k)}={shlex.quote(v)}"
-            for k, v in inject_env.items()
-        )
-    if env_parts:
-        agent_cmd = f"env {' '.join(env_parts)} {agent_cmd}"
 
     # Resolve cwd to absolute path (tmux -c needs it)
     from pathlib import Path
     abs_cwd = str(Path(cwd).resolve())
 
     # Wire up injection with the tmux session name
-    inject_fn = lambda text: inject(text, tmux_session=session_name, delay=inject_delay)
+    recovery_restart_requested = [False]
+
+    def _request_fresh_claude_session(reason: str) -> bool:
+        recovery_restart_requested[0] = True
+        print(f"  Claude recovery: {reason}; restarting with a fresh session id before injection.")
+        subprocess.run(
+            ["tmux", "kill-session", "-t", session_name],
+            capture_output=True,
+        )
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if _session_exists(session_name):
+                time.sleep(1.0)
+                return True
+            time.sleep(0.25)
+        print("  Claude recovery: timed out waiting for restarted tmux session; trigger skipped.")
+        return False
+
+    def inject_fn(text):
+        if agent == "claude":
+            pane = _capture_pane(session_name)
+            if _looks_like_claude_thinking_block_error(pane):
+                if not _request_fresh_claude_session("thinking-block API error detected"):
+                    return
+            elif _looks_like_claude_interrupted_prompt(pane):
+                if not _request_fresh_claude_session("interrupted prompt detected"):
+                    return
+        inject(text, tmux_session=session_name, delay=inject_delay)
+
     start_watcher(inject_fn)
 
     print(f"  Using tmux session: {session_name}")
@@ -136,6 +218,13 @@ def run_agent(
                 ["tmux", "kill-session", "-t", session_name],
                 capture_output=True,
             )
+
+            if agent == "claude" and recovery_restart_requested[0]:
+                session_id = _refresh_claude_session_id(extra_args)
+                recovery_restart_requested[0] = False
+                print(f"  Claude recovery: new --session-id {session_id}")
+
+            agent_cmd = _build_agent_cmd(command, extra_args, strip_env, inject_env)
 
             # Create tmux session running the agent CLI
             result = subprocess.run(
@@ -158,6 +247,10 @@ def run_agent(
                 print(f"  Reattach: tmux attach -t {session_name}")
                 while _session_exists(session_name):
                     time.sleep(1)
+                if agent == "claude" and recovery_restart_requested[0] and not no_restart:
+                    print("\n  Claude recovery requested while detached; restarting in 3s...")
+                    time.sleep(3)
+                    continue
                 break
 
             # Session gone — agent exited

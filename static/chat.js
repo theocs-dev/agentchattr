@@ -27,6 +27,8 @@ window.customRoles = [];  // saved custom roles from settings
 let colorOverrides = JSON.parse(localStorage.getItem('agentchattr-color-overrides') || '{}');
 let schedulesList = [];  // array of schedule objects from server
 let selectedAgentProfiles = {};  // { base: profile_name }
+let selectedAgentFastModes = {};  // { base: boolean }
+let selectedDefaultMention = 'all';
 const MENTION_NAME_SOURCE = String.raw`[\p{L}\p{N}_][\p{L}\p{N}\p{M}_-]*`;
 function mentionRegex(flags = 'gu') {
     return new RegExp(`@(${MENTION_NAME_SOURCE})`, flags);
@@ -480,6 +482,7 @@ function connectWebSocket() {
             applyAgentConfig(event.data);
         } else if (event.type === 'base_colors') {
             baseColors = event.data || {};
+            buildDefaultMentionSettings();
         } else if (event.type === 'todos') {
             todos = {};
             for (const [id, status] of Object.entries(event.data)) {
@@ -969,9 +972,13 @@ function applyAgentConfig(data) {
         if (cfg.base && cfg.profile?.selected) {
             selectedAgentProfiles[cfg.base] = cfg.profile.selected;
         }
+        if (cfg.base && cfg.fast_mode?.supported) {
+            selectedAgentFastModes[cfg.base] = !!cfg.fast_mode.enabled;
+        }
     }
     buildStatusPills();
     buildAgentProfileSettings();
+    buildDefaultMentionSettings();
     buildMentionToggles();
     buildSoundSettings();
     // Re-color any messages already rendered (e.g. from a reconnect)
@@ -1166,7 +1173,8 @@ function buildStatusPills() {
         pill.style.setProperty('--agent-color', colorOverrides[name] || cfg.color || '#4ade80');
         const profile = getSelectedProfile(cfg);
         const profileLabel = profile?.label || cfg.profile?.selected || '';
-        const meta = [cfg.label || name, profileLabel].filter(Boolean).join(' · ');
+        const fastLabel = getFastModeLabel(cfg);
+        const meta = [cfg.label || name, profileLabel, fastLabel].filter(Boolean).join(' · ');
         pill.innerHTML = `
             <span class="status-dot"></span>
             <span class="status-body">
@@ -1199,6 +1207,11 @@ function getSelectedProfile(cfg) {
     return selected ? profiles[selected] : null;
 }
 
+function getFastModeLabel(cfg) {
+    if (!cfg?.fast_mode?.supported) return '';
+    return cfg.fast_mode.enabled ? 'Fast' : 'Standard';
+}
+
 function buildAgentProfileSettings() {
     const bases = ['claude', 'codex'];
     for (const base of bases) {
@@ -1228,6 +1241,68 @@ function buildAgentProfileSettings() {
         }
         field.classList.remove('hidden');
     }
+    buildAgentFastSettings();
+}
+
+function buildAgentFastSettings() {
+    const field = document.getElementById('agent-fast-claude-field');
+    const input = document.getElementById('setting-fast-claude');
+    if (!field || !input) return;
+
+    const instanceCfg = Object.values(agentConfig).find(cfg => cfg.base === 'claude');
+    const supported = instanceCfg?.fast_mode?.supported;
+    if (!supported) {
+        field.classList.add('hidden');
+        return;
+    }
+    const enabled = instanceCfg?.fast_mode?.enabled ?? selectedAgentFastModes.claude ?? false;
+    input.checked = !!enabled;
+    field.classList.remove('hidden');
+}
+
+function normalizeDefaultMentionValue(value) {
+    let target = String(value || 'all').trim().toLowerCase();
+    if (target.startsWith('@')) target = target.slice(1);
+    if (target === 'both') target = 'all';
+    return target || 'all';
+}
+
+function buildDefaultMentionSettings() {
+    const select = document.getElementById('setting-default-mention');
+    if (!select) return;
+
+    const selected = normalizeDefaultMentionValue(selectedDefaultMention);
+    const seen = new Set();
+    const options = [];
+    const addOption = (value, label) => {
+        const normalized = normalizeDefaultMentionValue(value);
+        if (seen.has(normalized)) return;
+        seen.add(normalized);
+        options.push({ value: normalized, label });
+    };
+
+    addOption('all', '@all');
+    addOption('none', 'Manual');
+
+    for (const [base, cfg] of Object.entries(baseColors).sort(([a], [b]) => a.localeCompare(b))) {
+        addOption(base, cfg?.label ? `@${base} · ${cfg.label}` : `@${base}`);
+    }
+    for (const [name, cfg] of Object.entries(agentConfig).sort(([a], [b]) => a.localeCompare(b))) {
+        addOption(name, cfg?.label ? `@${name} · ${cfg.label}` : `@${name}`);
+    }
+    if (!seen.has(selected)) {
+        addOption(selected, `@${selected}`);
+    }
+
+    select.innerHTML = '';
+    for (const opt of options) {
+        const el = document.createElement('option');
+        el.value = opt.value;
+        el.textContent = opt.label;
+        if (opt.value === selected) el.selected = true;
+        select.appendChild(el);
+    }
+    select.value = selected;
 }
 
 function formatTokenCount(n) {
@@ -1257,10 +1332,11 @@ function updateTokenMeters() {
         }
         const model = profile?.model || 'default model';
         const reasoning = profile?.reasoning || 'default reasoning';
+        const fastLabel = getFastModeLabel(cfg);
         const usageText = ok && limit
             ? `${formatTokenCount(used)} / ${formatTokenCount(limit)}`
             : 'usage unavailable';
-        pill.title = `@${name} · ${model} · ${reasoning} · ${usageText}`;
+        pill.title = `@${name} · ${model} · ${reasoning}${fastLabel ? ` · ${fastLabel}` : ''} · ${usageText}`;
     }
 }
 window.updateTokenMeters = updateTokenMeters;
@@ -1856,6 +1932,10 @@ function applySettings(data) {
         document.body.classList.add('font-' + data.font);
         document.getElementById('setting-font').value = data.font;
     }
+    if (data.default_mention !== undefined) {
+        selectedDefaultMention = normalizeDefaultMentionValue(data.default_mention);
+        buildDefaultMentionSettings();
+    }
     if (data.max_agent_hops !== undefined) {
         document.getElementById('setting-hops').value = data.max_agent_hops;
     }
@@ -1875,6 +1955,10 @@ function applySettings(data) {
     if (data.agent_profiles && typeof data.agent_profiles === 'object') {
         selectedAgentProfiles = data.agent_profiles;
         buildAgentProfileSettings();
+    }
+    if (data.agent_fast_modes && typeof data.agent_fast_modes === 'object') {
+        selectedAgentFastModes = data.agent_fast_modes;
+        buildAgentFastSettings();
     }
     if (data.channels && Array.isArray(data.channels)) {
         channelList = data.channels;
@@ -1979,11 +2063,17 @@ function saveSettings() {
     const newHistory = histVal === 'all' ? 'all' : (parseInt(histVal) || 50);
     const newContrast = document.getElementById('setting-contrast').value;
     const newRulesRefresh = document.getElementById('setting-rules-refresh').value;
+    const defaultMention = normalizeDefaultMentionValue(
+        document.getElementById('setting-default-mention')?.value || selectedDefaultMention
+    );
     const agentProfiles = {};
     for (const base of ['claude', 'codex']) {
         const select = document.getElementById(`setting-profile-${base}`);
         if (select && select.value) agentProfiles[base] = select.value;
     }
+    const agentFastModes = {};
+    const claudeFast = document.getElementById('setting-fast-claude');
+    if (claudeFast) agentFastModes.claude = !!claudeFast.checked;
 
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
@@ -1991,11 +2081,13 @@ function saveSettings() {
             data: {
                 username: newUsername || 'user',
                 font: newFont,
+                default_mention: defaultMention,
                 max_agent_hops: parseInt(newHops) || 4,
                 history_limit: newHistory,
                 contrast: newContrast,
                 rules_refresh_interval: parseInt(newRulesRefresh) || 0,
                 agent_profiles: agentProfiles,
+                agent_fast_modes: agentFastModes,
             }
         }));
     }
@@ -2018,7 +2110,7 @@ function setupSettingsKeys() {
     }
 
     // Auto-save on change for selects, escape to close
-    for (const id of ['setting-font', 'setting-history', 'setting-contrast', 'setting-rules-refresh', 'setting-profile-claude', 'setting-profile-codex']) {
+    for (const id of ['setting-font', 'setting-default-mention', 'setting-history', 'setting-contrast', 'setting-rules-refresh', 'setting-profile-claude', 'setting-profile-codex', 'setting-fast-claude']) {
         const el = document.getElementById(id);
         if (!el) continue;
         el.addEventListener('change', () => {
@@ -2168,7 +2260,8 @@ const SLASH_COMMANDS = [
     { cmd: '/poetry sonnet', desc: 'Agents write a sonnet about the codebase', broadcast: true },
     { cmd: '/summary', desc: 'Summarize recent messages — tag an agent (e.g. /summary @claude)', broadcast: false, needsMention: true },
     { cmd: '/summarise', desc: 'Summarize recent messages — tag an agent (e.g. /summarise @claude)', broadcast: false, needsMention: true, hidden: true },
-    { cmd: '/model', desc: 'List or set launch profile (e.g. /model codex fast)', broadcast: false },
+    { cmd: '/model', desc: 'List or set launch profile (e.g. /model claude max, /model codex xhigh)', broadcast: false },
+    { cmd: '/fast', desc: 'Toggle Claude fast mode (or use /fast on, /fast off, /fast status)', broadcast: false },
     { cmd: '/continue', desc: 'Resume after loop guard pauses', broadcast: false },
     { cmd: '/clear', desc: 'Clear messages in current channel', broadcast: false },
 ];
@@ -3911,7 +4004,7 @@ function _helpCardDefs() {
             light: true,
             html:
             '<div class="hg-module-title">Mentions <span class="hg-loc">pills above composer</span></div>' +
-            '<p class="hg-module-desc">Type <strong>@</strong> in the composer to mention an agent. The pills above the input let you pre-select who to address. Selected agents are mentioned automatically when you send.</p>' +
+            '<p class="hg-module-desc">Type <strong>@</strong> in the composer to mention an agent. Messages without an explicit mention use the Default @ setting. The pills above the input let you pre-select who to address.</p>' +
             '<p class="hg-module-tip">Mentioned agents receive a trigger and will respond in the channel.</p>'
         },
         {

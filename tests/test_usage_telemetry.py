@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
 import uuid
 from datetime import datetime, timezone
@@ -21,6 +22,12 @@ from wrapper import (  # noqa: E402
     _parse_claude_usage_lines,
     _parse_codex_usage_lines,
     _profile_claude_session_id,
+)
+from wrapper_unix import (  # noqa: E402
+    _build_agent_cmd,
+    _looks_like_claude_interrupted_prompt,
+    _looks_like_claude_thinking_block_error,
+    _refresh_claude_session_id,
 )
 
 
@@ -65,6 +72,36 @@ class ProfileArgsTests(unittest.TestCase):
         self.assertIn('-c', args)
         self.assertIn('model_reasoning_effort="high"', args)
         self.assertIsNone(_profile_claude_session_id(args))
+
+    def test_default_config_launches_claude_at_max_effort_with_fast_mode(self):
+        config = tomllib.loads((ROOT / "config.toml").read_text("utf-8"))
+
+        args = _build_profile_args("claude", config["agents"]["claude"], self.data_dir)
+
+        self.assertIn("--effort", args)
+        self.assertIn("max", args)
+        self.assertIn("--settings", args)
+        self.assertIn('{"fastMode":true}', args)
+
+    def test_settings_can_disable_claude_fast_mode(self):
+        config = tomllib.loads((ROOT / "config.toml").read_text("utf-8"))
+        (self.data_dir / "settings.json").write_text(
+            '{"agent_fast_modes":{"claude":false}}',
+            "utf-8",
+        )
+
+        args = _build_profile_args("claude", config["agents"]["claude"], self.data_dir)
+
+        self.assertIn("--settings", args)
+        self.assertIn('{"fastMode":false}', args)
+
+    def test_default_config_launches_codex_at_extra_high_effort(self):
+        config = tomllib.loads((ROOT / "config.toml").read_text("utf-8"))
+
+        args = _build_profile_args("codex", config["agents"]["codex"], self.data_dir)
+
+        self.assertIn('-c', args)
+        self.assertIn('model_reasoning_effort="xhigh"', args)
 
 
 class UsageParserTests(unittest.TestCase):
@@ -213,6 +250,62 @@ class PermissionPromptTests(unittest.TestCase):
         for text in negatives:
             with self.subTest(text=text):
                 self.assertFalse(_looks_like_permission_prompt(text))
+
+
+class ClaudeTerminalRecoveryTests(unittest.TestCase):
+    def test_detects_claude_thinking_block_api_error(self):
+        text = (
+            "API Error: 400 messages.1.content.9: `thinking` or "
+            "`redacted_thinking` blocks in the latest assistant message cannot be modified."
+        )
+
+        self.assertTrue(_looks_like_claude_thinking_block_error(text))
+
+    def test_detects_claude_interrupted_prompt(self):
+        text = "Interrupted · What should Claude do instead?"
+
+        self.assertTrue(_looks_like_claude_interrupted_prompt(text))
+
+    def test_ignores_normal_claude_output_for_recovery(self):
+        text = "Allowed by auto mode classifier\nBrewed for 3s\n>"
+
+        self.assertFalse(_looks_like_claude_thinking_block_error(text))
+        self.assertFalse(_looks_like_claude_interrupted_prompt(text))
+
+    def test_ignores_stale_interrupted_prompt_outside_recent_tail(self):
+        text = "Interrupted · What should Claude do instead?\n" + "\n".join(
+            f"normal line {idx}" for idx in range(12)
+        )
+
+        self.assertFalse(_looks_like_claude_interrupted_prompt(text))
+
+    def test_refresh_claude_session_id_replaces_existing_id(self):
+        old_id = str(uuid.uuid4())
+        args = ["--model", "opus", "--session-id", old_id]
+
+        new_id = _refresh_claude_session_id(args)
+
+        self.assertNotEqual(new_id, old_id)
+        self.assertEqual(args[-1], new_id)
+        uuid.UUID(new_id)
+
+    def test_refresh_claude_session_id_appends_when_absent(self):
+        args = ["--model", "opus"]
+
+        new_id = _refresh_claude_session_id(args)
+
+        self.assertEqual(args[-2:], ["--session-id", new_id])
+        uuid.UUID(new_id)
+
+    def test_rebuilt_tmux_command_uses_refreshed_session_id(self):
+        old_id = str(uuid.uuid4())
+        args = ["--model", "opus", "--session-id", old_id]
+
+        new_id = _refresh_claude_session_id(args)
+        command = _build_agent_cmd("claude", args)
+
+        self.assertIn(new_id, command)
+        self.assertNotIn(old_id, command)
 
 
 if __name__ == "__main__":

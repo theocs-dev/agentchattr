@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
 import app  # noqa: E402
 from app import _leading_mentions_and_command_text  # noqa: E402
 from registry import RuntimeRegistry  # noqa: E402
+from router import Router  # noqa: E402
 
 
 class ModelCommandParsingTests(unittest.TestCase):
@@ -46,6 +47,11 @@ class ModelCommandParsingTests(unittest.TestCase):
         self.assertEqual(mentions, [])
         self.assertEqual(command, "/model @codex")
 
+    def test_normalizes_default_mention_handles(self):
+        self.assertEqual(app._normalize_default_mention("@Claude"), "claude")
+        self.assertEqual(app._normalize_default_mention("both"), "all")
+        self.assertEqual(app._normalize_default_mention("../claude", fallback="all"), "all")
+
     def test_profile_can_be_selected_by_reasoning_alias(self):
         app.config.clear()
         app.config.update({
@@ -68,6 +74,7 @@ class ModelCommandParsingTests(unittest.TestCase):
         app.config.update({
             "agents": {
                 "claude": {
+                    "fast_mode_default": True,
                     "profiles": {
                         "xhigh": {
                             "label": "Opus 4.7 XHigh",
@@ -85,7 +92,27 @@ class ModelCommandParsingTests(unittest.TestCase):
         listing = app._format_profile_list("claude")
 
         self.assertIn("window 1 000 000", listing)
+        self.assertIn("claude fast mode: ON", listing)
         self.assertNotIn("budget 1 000 000", listing)
+
+    def test_profile_list_names_claude_fast_mode_off(self):
+        app.config.clear()
+        app.config.update({
+            "agents": {
+                "claude": {
+                    "fast_mode_default": True,
+                    "profiles": {
+                        "max": {"label": "Opus Max", "reasoning": "max", "default": True},
+                    },
+                },
+            }
+        })
+        app.room_settings["agent_profiles"] = {}
+        app.room_settings["agent_fast_modes"] = {"claude": False}
+
+        listing = app._format_profile_list("claude")
+
+        self.assertIn("claude fast mode: OFF", listing)
 
 
 class DummyStore:
@@ -125,6 +152,90 @@ class DummyRequest:
 
     async def json(self):
         return dict(self._body)
+
+
+class ModelCommandHandlingTests(unittest.TestCase):
+    def setUp(self):
+        self._config = deepcopy(app.config)
+        self._room_settings = deepcopy(app.room_settings)
+        self._store = app.store
+        self._save_settings = app._save_settings
+        self._broadcast_settings = app.broadcast_settings
+        self._broadcast_agents = app.broadcast_agents
+        self._broadcast_status = app.broadcast_status
+        app.store = DummyStore()
+        app._save_settings = lambda: None
+
+        async def noop():
+            return None
+
+        app.broadcast_settings = noop
+        app.broadcast_agents = noop
+        app.broadcast_status = noop
+        app.config.clear()
+        app.config.update({
+            "agents": {
+                "claude": {
+                    "fast_mode_default": True,
+                    "profiles": {
+                        "max": {"label": "Opus Max", "reasoning": "max", "default": True},
+                        "xhigh": {"label": "Opus XHigh", "reasoning": "xhigh"},
+                    },
+                },
+                "codex": {
+                    "profiles": {
+                        "balanced": {"label": "Balanced", "reasoning": "high"},
+                        "deep": {"label": "Extra High", "reasoning": "xhigh", "default": True},
+                    },
+                },
+            },
+        })
+        app.room_settings["agent_profiles"] = {}
+        app.room_settings["agent_fast_modes"] = {}
+
+    def tearDown(self):
+        app.config.clear()
+        app.config.update(self._config)
+        app.room_settings.clear()
+        app.room_settings.update(self._room_settings)
+        app.store = self._store
+        app._save_settings = self._save_settings
+        app.broadcast_settings = self._broadcast_settings
+        app.broadcast_agents = self._broadcast_agents
+        app.broadcast_status = self._broadcast_status
+
+    def test_direct_model_command_selects_claude_max(self):
+        asyncio.run(app._handle_model_command(["/model", "claude", "max"], "general"))
+
+        self.assertEqual(app.room_settings["agent_profiles"]["claude"], "max")
+        self.assertIn("claude profile set to Opus Max", app.store.messages[-1]["text"])
+
+    def test_addressed_model_command_selects_codex_by_reasoning_alias(self):
+        asyncio.run(app._handle_model_command(["/model", "xhigh"], "general", ["codex"]))
+
+        self.assertEqual(app.room_settings["agent_profiles"]["codex"], "deep")
+        self.assertIn("codex profile set to Extra High", app.store.messages[-1]["text"])
+
+    def test_fast_command_toggles_claude_fast_mode(self):
+        app.room_settings["agent_fast_modes"] = {"claude": True}
+
+        asyncio.run(app._handle_fast_command(["/fast"], "general"))
+
+        self.assertFalse(app.room_settings["agent_fast_modes"]["claude"])
+        self.assertIn("claude fast mode set to OFF", app.store.messages[-1]["text"])
+
+    def test_fast_command_accepts_explicit_on_off(self):
+        app.room_settings["agent_fast_modes"] = {"claude": False}
+
+        asyncio.run(app._handle_fast_command(["/fast", "on"], "general"))
+
+        self.assertTrue(app.room_settings["agent_fast_modes"]["claude"])
+        self.assertIn("claude fast mode set to ON", app.store.messages[-1]["text"])
+
+    def test_addressed_fast_command_rejects_codex(self):
+        asyncio.run(app._handle_fast_command(["/fast"], "general", ["codex"]))
+
+        self.assertIn("only configured for Claude", app.store.messages[-1]["text"])
 
 
 class TargetResolutionTests(unittest.TestCase):
@@ -273,6 +384,92 @@ class TargetResolutionTests(unittest.TestCase):
         self.assertEqual(app.agents.triggered, [])
         self.assertEqual(len(app.store.messages), 1)
         self.assertIn("@claude is ambiguous", app.store.messages[0]["text"])
+
+
+class MessageDefaultRoutingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._old_config = deepcopy(app.config)
+        self._old_registry = app.registry
+        self._old_router = app.router
+        self._old_store = app.store
+        self._old_agents = app.agents
+        self._old_session_engine = app.session_engine
+
+        app.config.clear()
+        app.config.update({
+            "agents": {
+                "claude": {"label": "Claude", "color": "#da7756"},
+                "codex": {"label": "Codex", "color": "#4ade80"},
+            },
+        })
+        reg = RuntimeRegistry(data_dir=self.tmp.name)
+        reg.seed(app.config["agents"])
+        reg.register("claude")
+        reg.register("codex")
+        app.registry = reg
+        app.router = Router(
+            ["claude", "codex"],
+            default_mention="all",
+            online_checker=lambda: set(reg.get_active_names()),
+        )
+        app.store = DummyStore()
+        app.agents = DummyAgents()
+        app.session_engine = None
+
+    def tearDown(self):
+        app.config.clear()
+        app.config.update(self._old_config)
+        app.registry = self._old_registry
+        app.router = self._old_router
+        app.store = self._old_store
+        app.agents = self._old_agents
+        app.session_engine = self._old_session_engine
+
+    def test_human_message_without_mention_routes_to_all_by_default(self):
+        asyncio.run(app._handle_new_message({
+            "sender": "Theo",
+            "text": "please check this",
+            "channel": "general",
+        }))
+
+        self.assertEqual(
+            [trigger["agent"] for trigger in app.agents.triggered],
+            ["claude", "codex"],
+        )
+
+    def test_manual_default_keeps_unmentioned_message_unrouted(self):
+        app.router.default_mention = "none"
+
+        asyncio.run(app._handle_new_message({
+            "sender": "Theo",
+            "text": "please check this",
+            "channel": "general",
+        }))
+
+        self.assertEqual(app.agents.triggered, [])
+
+    def test_specific_default_routes_to_that_agent_only(self):
+        app.router.default_mention = "codex"
+
+        asyncio.run(app._handle_new_message({
+            "sender": "Theo",
+            "text": "please check this",
+            "channel": "general",
+        }))
+
+        self.assertEqual(
+            [trigger["agent"] for trigger in app.agents.triggered],
+            ["codex"],
+        )
+
+    def test_settings_default_mention_applies_to_router(self):
+        app.room_settings["default_mention"] = "@codex"
+
+        app._apply_default_mention_to_router()
+
+        self.assertEqual(app.router.default_mention, "codex")
 
 
 class FrontendMentionCandidateTests(unittest.TestCase):

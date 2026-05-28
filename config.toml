@@ -12,6 +12,15 @@ command = "claude"
 cwd = "/Users/theocs/IPCRA"
 color = "#da7756"
 label = "Claude"
+fast_mode_default = true
+
+[agents.claude.profiles.max]
+label = "Opus 4.7 Max"
+model = "opus"
+reasoning = "max"
+context_limit = 1000000
+args = ["--permission-mode", "auto"]
+default = true
 
 [agents.claude.profiles.xhigh]
 label = "Opus 4.7 XHigh"
@@ -19,7 +28,6 @@ model = "opus"
 reasoning = "xhigh"
 context_limit = 1000000
 args = ["--permission-mode", "auto"]
-default = true
 
 [agents.claude.profiles.high]
 label = "Opus 4.7 High"
@@ -53,7 +61,6 @@ label = "Balanced"
 model = "gpt-5.5"
 reasoning = "high"
 context_limit = 258000
-default = true
 
 [agents.codex.profiles.fast]
 label = "Fast"
@@ -62,10 +69,11 @@ reasoning = "medium"
 context_limit = 258000
 
 [agents.codex.profiles.deep]
-label = "Deep"
+label = "Extra High"
 model = "gpt-5.5"
 reasoning = "xhigh"
 context_limit = 258000
+default = true
 
 [agents.gemini]
 command = "gemini"
@@ -127,7 +135,7 @@ temperature = 1.0
 
 [routing]
 # "none" = only route on explicit @mention. "all" = route to all agents by default.
-default = "none"
+default = "all"
 max_agent_hops = 4
 
 [mcp]
