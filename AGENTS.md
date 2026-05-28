@@ -37,6 +37,20 @@ git switch -c <short-topic-branch> theo/main
   `theo/main` when the user wants the change published.
 - Merge only after the user has approved the result, relevant tests/checks have
   passed or their absence is clearly reported, and there are no known blockers.
+- When the user asks to publish, open a PR, mark it ready, merge it, or update
+  local `main` afterward, the agent should perform those Git/GitHub steps
+  directly instead of handing commands back to the user. The user provides
+  approval and validation; the agent reports any blocker such as missing
+  credentials, failing checks, or merge conflicts.
+- The agent should guide the user through the publish/PR/merge/update flow in
+  the correct order and proactively remind them of the next step when needed.
+  Do not assume the user remembers the GitHub workflow or knows which step
+  comes next.
+- Keep one feature or fix per chat thread. If the user starts asking for a
+  different implementation than the original feature/fix for the conversation,
+  pause and point out the scope change. Suggest documenting the new request so
+  it can be handled in a separate/new chat with a fresh agent and a clean
+  branch.
 
 ## Change Discipline
 
