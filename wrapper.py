@@ -981,8 +981,26 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
+def _build_arg_parser(agent_names: list[str]) -> "argparse.ArgumentParser":
     import argparse
+
+    parser = argparse.ArgumentParser(description="Agent wrapper with chat auto-trigger")
+    parser.add_argument("agent", choices=agent_names, help=f"Agent to wrap ({', '.join(agent_names)})")
+    parser.add_argument("--no-restart", action="store_true", help="Do not restart on exit")
+    parser.add_argument("--label", type=str, default=None, help="Custom display label")
+    parser.add_argument("--cwd", type=str, default=None, help="Override the agent working directory for this launch")
+    # Per-project isolation flags (must match the server's flags so wrappers
+    # launched separately connect to the right instance). Values are consumed
+    # by apply_cli_overrides() above; listing here so --help shows them.
+    parser.add_argument("--data-dir",      default=None, help="Override server.data_dir (path)")
+    parser.add_argument("--port",          default=None, help="Override server.port (int)")
+    parser.add_argument("--mcp-http-port", default=None, help="Override mcp.http_port (int)")
+    parser.add_argument("--mcp-sse-port",  default=None, help="Override mcp.sse_port (int)")
+    parser.add_argument("--upload-dir",    default=None, help="Override images.upload_dir (path)")
+    return parser
+
+
+def main():
     import urllib.error
     import urllib.request
 
@@ -995,20 +1013,7 @@ def main():
     config = load_config(ROOT)
 
     agent_names = list(config.get("agents", {}).keys())
-
-    parser = argparse.ArgumentParser(description="Agent wrapper with chat auto-trigger")
-    parser.add_argument("agent", choices=agent_names, help=f"Agent to wrap ({', '.join(agent_names)})")
-    parser.add_argument("--no-restart", action="store_true", help="Do not restart on exit")
-    parser.add_argument("--label", type=str, default=None, help="Custom display label")
-    parser.add_argument("--cwd", type=str, default=None, help="Override the agent working directory")
-    # Per-project isolation flags (must match the server's flags so wrappers
-    # launched separately connect to the right instance). Values are consumed
-    # by apply_cli_overrides() above; listing here so --help shows them.
-    parser.add_argument("--data-dir",      default=None, help="Override server.data_dir (path)")
-    parser.add_argument("--port",          default=None, help="Override server.port (int)")
-    parser.add_argument("--mcp-http-port", default=None, help="Override mcp.http_port (int)")
-    parser.add_argument("--mcp-sse-port",  default=None, help="Override mcp.sse_port (int)")
-    parser.add_argument("--upload-dir",    default=None, help="Override images.upload_dir (path)")
+    parser = _build_arg_parser(agent_names)
     args, extra = parser.parse_known_args()
 
     agent = args.agent
