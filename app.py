@@ -46,6 +46,7 @@ ws_clients: set[WebSocket] = set()
 usage_snapshots: dict[str, dict] = {}
 _target_resolution_warning_times: dict[tuple, float] = {}
 _TARGET_RESOLUTION_WARNING_TTL = 30
+_WS_SEND_TIMEOUT = 2.0
 _DEFAULT_MENTION_TARGET_RE = _re.compile(r"^[\w-]{1,64}$", _re.UNICODE)
 
 # --- Security: session token (set by configure()) ---
@@ -1059,24 +1060,35 @@ async def _handle_new_message(msg: dict):
 
 async def _broadcast(raw_json: str):
     """Send a pre-serialized JSON string to all WebSocket clients."""
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(raw_json)
-        except Exception:
-            dead.add(client)
+    await _broadcast_text(raw_json)
+
+
+async def _broadcast_text(data: str):
+    """Broadcast to WebSocket clients without letting a stale client hang routing."""
+    clients = list(ws_clients)
+    results = await asyncio.gather(
+        *(_send_ws_text(client, data) for client in clients),
+        return_exceptions=True,
+    )
+    dead = {
+        client
+        for client, result in zip(clients, results)
+        if result is not True
+    }
     ws_clients.difference_update(dead)
+
+
+async def _send_ws_text(client: WebSocket, data: str) -> bool:
+    try:
+        await asyncio.wait_for(client.send_text(data), timeout=_WS_SEND_TIMEOUT)
+        return True
+    except Exception:
+        return False
 
 
 async def broadcast(msg: dict):
     data = json.dumps({"type": "message", "data": msg})
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(data)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    await _broadcast_text(data)
 
 
 def _status_payload() -> dict:
@@ -1091,13 +1103,7 @@ def _status_payload() -> dict:
 async def broadcast_status():
     status = _status_payload()
     data = json.dumps({"type": "status", "data": status})
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(data)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    await _broadcast_text(data)
 
 
 def _format_profile_list(base: str) -> str:
@@ -1291,13 +1297,7 @@ async def _handle_model_command(cmd_parts: list[str], channel: str, mentioned_ba
 
 async def broadcast_typing(agent_name: str, is_typing: bool):
     data = json.dumps({"type": "typing", "agent": agent_name, "active": is_typing})
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(data)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    await _broadcast_text(data)
 
 
 async def broadcast_clear(channel: str | None = None):
@@ -1305,103 +1305,49 @@ async def broadcast_clear(channel: str | None = None):
     if channel:
         payload["channel"] = channel
     data = json.dumps(payload)
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(data)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    await _broadcast_text(data)
 
 
 async def broadcast_todo_update(msg_id: int, status: str | None):
     data = json.dumps({"type": "todo_update", "data": {"id": msg_id, "status": status}})
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(data)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    await _broadcast_text(data)
 
 
 async def broadcast_settings():
     data = json.dumps({"type": "settings", "data": room_settings})
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(data)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    await _broadcast_text(data)
 
 
 async def broadcast_rule(action: str, rule: dict):
     data = json.dumps({"type": "rule", "action": action, "data": rule})
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(data)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    await _broadcast_text(data)
 
 
 async def broadcast_job(action: str, data: dict):
     payload = json.dumps({"type": "job", "action": action, "data": data})
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(payload)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    await _broadcast_text(payload)
 
 
 async def broadcast_schedule(action: str, schedule: dict):
     payload = json.dumps({"type": "schedule", "action": action, "data": schedule})
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(payload)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    await _broadcast_text(payload)
 
 
 async def broadcast_session(action: str, session: dict):
     payload = json.dumps({"type": "session", "action": action, "data": session})
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(payload)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    await _broadcast_text(payload)
 
 
 async def broadcast_hats():
     data = json.dumps({"type": "hats", "data": agent_hats})
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(data)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    await _broadcast_text(data)
 
 
 async def broadcast_agents():
     """Send updated agent config (from registry) to all WebSocket clients."""
     agent_cfg = _agent_config_for_client()
     data = json.dumps({"type": "agents", "data": agent_cfg})
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(data)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    await _broadcast_text(data)
 
 
 def _on_registry_change():
@@ -1558,13 +1504,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     deleted = store.delete([int(i) for i in ids])
                     if deleted:
                         data = json.dumps({"type": "delete", "ids": deleted})
-                        dead = set()
-                        for client in list(ws_clients):
-                            try:
-                                await client.send_text(data)
-                            except Exception:
-                                dead.add(client)
-                        ws_clients.difference_update(dead)
+                        await _broadcast_text(data)
                 continue
 
             elif event.get("type") == "todo_add":
@@ -1656,11 +1596,7 @@ async def websocket_endpoint(websocket: WebSocket):
             elif event.get("type") == "rule_remind":
                 rules.set_remind()
                 remind_data = json.dumps({"type": "rules_remind", "data": {}})
-                for client in list(ws_clients):
-                    try:
-                        await client.send_text(remind_data)
-                    except Exception:
-                        pass
+                await _broadcast_text(remind_data)
                 continue
 
             elif event.get("type") == "update_settings":
@@ -1861,11 +1797,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "old_name": old_name,
                     "new_name": new_name,
                 })
-                for c in list(ws_clients):
-                    try:
-                        await c.send_text(rename_event)
-                    except Exception:
-                        pass
+                await _broadcast_text(rename_event)
 
             elif event.get("type") == "channel_delete":
                 name = (event.get("name") or "").strip().lower()
@@ -1968,13 +1900,7 @@ async def import_history(file: UploadFile = File(...)):
         await broadcast_settings()
     # Tell all connected clients to reload (picks up imported messages)
     data = json.dumps({"type": "reload"})
-    dead = set()
-    for client in list(ws_clients):
-        try:
-            await client.send_text(data)
-        except Exception:
-            dead.add(client)
-    ws_clients.difference_update(dead)
+    await _broadcast_text(data)
     return JSONResponse(report)
 
 
@@ -2150,13 +2076,7 @@ async def demote_proposal(msg_id: int):
     if updated:
         # Broadcast the updated message to all clients
         payload = json.dumps({"type": "edit", "message": updated})
-        dead = set()
-        for client in list(ws_clients):
-            try:
-                await client.send_text(payload)
-            except Exception:
-                dead.add(client)
-        ws_clients.difference_update(dead)
+        await _broadcast_text(payload)
     return updated or {"ok": True}
 
 
@@ -2241,13 +2161,7 @@ async def resolve_rule_proposal(msg_id: int, request: Request):
     if updated:
         # Broadcast the updated message so all clients re-render the card
         payload = json.dumps({"type": "edit", "message": updated})
-        dead = set()
-        for client in list(ws_clients):
-            try:
-                await client.send_text(payload)
-            except Exception:
-                dead.add(client)
-        ws_clients.difference_update(dead)
+        await _broadcast_text(payload)
     return updated or {"ok": True}
 
 
@@ -2271,13 +2185,7 @@ async def demote_rule_proposal(msg_id: int):
     })
     if updated:
         payload = json.dumps({"type": "edit", "message": updated})
-        dead = set()
-        for client in list(ws_clients):
-            try:
-                await client.send_text(payload)
-            except Exception:
-                dead.add(client)
-        ws_clients.difference_update(dead)
+        await _broadcast_text(payload)
     return updated or {"ok": True}
 
 
@@ -2340,13 +2248,7 @@ async def create_job(request: Request):
             updated_msg = store.update_message(anchor_msg_id, {"metadata": meta})
             if updated_msg:
                 payload = json.dumps({"type": "edit", "message": updated_msg})
-                dead = set()
-                for client in list(ws_clients):
-                    try:
-                        await client.send_text(payload)
-                    except Exception:
-                        dead.add(client)
-                ws_clients.difference_update(dead)
+                await _broadcast_text(payload)
     # Post breadcrumb in main timeline with job_id for clickable link
     store.add(created_by, f"Job created: {title}", msg_type="job_created",
               channel=channel, metadata={"job_id": result["id"]})
@@ -2517,11 +2419,7 @@ async def remind_agents():
     """Set remind flag — agents get rules on next trigger."""
     rules.set_remind()
     remind_data = json.dumps({"type": "rules_remind", "data": {}})
-    for client in list(ws_clients):
-        try:
-            await client.send_text(remind_data)
-        except Exception:
-            pass
+    await _broadcast_text(remind_data)
     return JSONResponse({"ok": True})
 
 

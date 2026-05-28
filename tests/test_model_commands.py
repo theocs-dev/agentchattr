@@ -154,6 +154,19 @@ class DummyRequest:
         return dict(self._body)
 
 
+class HangingClient:
+    async def send_text(self, data):
+        await asyncio.Event().wait()
+
+
+class RecordingClient:
+    def __init__(self):
+        self.sent = []
+
+    async def send_text(self, data):
+        self.sent.append(data)
+
+
 class ModelCommandHandlingTests(unittest.TestCase):
     def setUp(self):
         self._config = deepcopy(app.config)
@@ -396,6 +409,8 @@ class MessageDefaultRoutingTests(unittest.TestCase):
         self._old_store = app.store
         self._old_agents = app.agents
         self._old_session_engine = app.session_engine
+        self._old_ws_clients = set(app.ws_clients)
+        self._old_ws_send_timeout = app._WS_SEND_TIMEOUT
 
         app.config.clear()
         app.config.update({
@@ -417,6 +432,8 @@ class MessageDefaultRoutingTests(unittest.TestCase):
         app.store = DummyStore()
         app.agents = DummyAgents()
         app.session_engine = None
+        app.ws_clients.clear()
+        app._WS_SEND_TIMEOUT = 0.01
 
     def tearDown(self):
         app.config.clear()
@@ -426,6 +443,9 @@ class MessageDefaultRoutingTests(unittest.TestCase):
         app.store = self._old_store
         app.agents = self._old_agents
         app.session_engine = self._old_session_engine
+        app.ws_clients.clear()
+        app.ws_clients.update(self._old_ws_clients)
+        app._WS_SEND_TIMEOUT = self._old_ws_send_timeout
 
     def test_human_message_without_mention_routes_to_all_by_default(self):
         asyncio.run(app._handle_new_message({
@@ -438,6 +458,40 @@ class MessageDefaultRoutingTests(unittest.TestCase):
             [trigger["agent"] for trigger in app.agents.triggered],
             ["claude", "codex"],
         )
+
+    def test_stale_websocket_does_not_block_default_routing(self):
+        app.ws_clients.add(HangingClient())
+
+        asyncio.run(asyncio.wait_for(app._handle_new_message({
+            "sender": "Theo",
+            "text": "please check this",
+            "channel": "test2",
+        }), timeout=0.5))
+
+        self.assertEqual(
+            [trigger["agent"] for trigger in app.agents.triggered],
+            ["claude", "codex"],
+        )
+        self.assertEqual(app.ws_clients, set())
+
+    def test_stale_websocket_does_not_drop_healthy_clients(self):
+        healthy = RecordingClient()
+        app.ws_clients.add(healthy)
+        app.ws_clients.add(HangingClient())
+
+        asyncio.run(asyncio.wait_for(app._handle_new_message({
+            "sender": "Theo",
+            "text": "please check this",
+            "channel": "test2",
+        }), timeout=0.5))
+
+        self.assertEqual(
+            [trigger["agent"] for trigger in app.agents.triggered],
+            ["claude", "codex"],
+        )
+        self.assertEqual(app.ws_clients, {healthy})
+        self.assertEqual(len(healthy.sent), 1)
+        self.assertIn('"type": "message"', healthy.sent[0])
 
     def test_manual_default_keeps_unmentioned_message_unrouted(self):
         app.router.default_mention = "none"
