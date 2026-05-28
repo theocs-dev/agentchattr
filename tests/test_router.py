@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -7,6 +8,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from router import Router
+from registry import RuntimeRegistry
+
+
+AGENTS = {
+    "codex": {"label": "Codex", "color": "#10a37f"},
+}
 
 
 class RouterMentionTests(unittest.TestCase):
@@ -85,6 +92,68 @@ class RouterMentionTests(unittest.TestCase):
 
         self.assertEqual(router.get_targets("ben", "/unknown"), [])
         self.assertEqual(router.get_targets("ben", "@codex /unknown"), ["codex"])
+
+
+class RegistryRenameChainTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.registry = RuntimeRegistry(data_dir=self.tmp.name)
+        self.registry.seed(AGENTS)
+
+    def test_registered_instance_stops_stale_rename_chain(self):
+        self.registry.register("codex")
+        self.registry.register("codex")
+        # Simulate persisted stale data from an earlier rename-back cycle.
+        self.registry._renames["codex-2"] = "codex"
+
+        self.assertEqual(self.registry.get_all_names(), ["codex-1", "codex-2"])
+        self.assertEqual(self.registry.resolve_name("codex-2"), "codex-2")
+
+    def test_heartbeat_resolution_does_not_refresh_ghost_instance(self):
+        self.registry.register("codex")
+        self.registry.register("codex")
+        self.registry._renames["codex-2"] = "codex"
+
+        presence = {}
+        current_name = "codex-2"
+        presence[current_name] = 1
+        canonical = self.registry.resolve_name(current_name)
+        inst = self.registry.get_instance(canonical)
+        if inst and canonical != current_name:
+            presence[canonical] = 1
+
+        self.assertEqual(canonical, "codex-2")
+        self.assertNotIn("codex-1", presence)
+
+    def test_fresh_registration_purges_stale_outgoing_rename(self):
+        self.registry._renames["codex"] = "codex-1"
+
+        self.registry.register("codex")
+
+        self.assertNotIn("codex", self.registry._renames)
+        self.assertEqual(self.registry.resolve_name("codex"), "codex")
+
+    def test_rename_back_purges_stale_target_key(self):
+        self.registry.register("codex")
+        self.registry.register("codex")
+        self.registry._renames["codex"] = "codex-1"
+
+        self.registry.deregister("codex-2")
+
+        self.assertEqual(self.registry.get_all_names(), ["codex"])
+        self.assertNotIn("codex", self.registry._renames)
+        self.assertEqual(self.registry.resolve_name("codex-1"), "codex")
+        self.assertEqual(self.registry.resolve_name("codex"), "codex")
+
+    def test_true_rename_from_old_unregistered_name_still_resolves(self):
+        self.registry.register("codex")
+
+        result = self.registry.rename("codex", "codex-review")
+
+        self.assertIsInstance(result, dict)
+        self.assertEqual(self.registry.resolve_name("codex"), "codex-review")
+        self.assertEqual(self.registry.resolve_name("codex-review"), "codex-review")
 
 
 if __name__ == "__main__":

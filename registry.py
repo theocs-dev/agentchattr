@@ -128,7 +128,7 @@ class RuntimeRegistry:
                     slot1.label = f"{base_cfg.get('label', base.capitalize())} 1"
                     # Color stays the same (slot 1 = base color)
                     self._instances[new_s1_name] = slot1
-                    self._renames[base] = new_s1_name
+                    self._record_rename_unlocked(base, new_s1_name)
                     renamed_slot1 = {"old": base, "new": new_s1_name}
 
             name = base if slot == 1 else f"{base}-{slot}"
@@ -147,6 +147,7 @@ class RuntimeRegistry:
             # not block on a manual confirmation step.
             state = "active"
             inst = Instance(name=name, base=base, slot=slot, label=lbl, color=color, state=state)
+            self._mark_authoritative_unlocked(name)
             self._instances[name] = inst
             result = _inst_dict(inst, include_token=True)
             if renamed_slot1:
@@ -184,7 +185,7 @@ class RuntimeRegistry:
                     remaining.label = base_cfg.get("label", base.capitalize())
                     remaining.color = _derive_color(base_cfg.get("color", "#888"), 1)
                     self._instances[base] = remaining
-                    self._renames[old_name] = base
+                    self._record_rename_unlocked(old_name, base)
                     renamed_back = {"old": old_name, "new": base}
 
         self._notify()
@@ -279,7 +280,7 @@ class RuntimeRegistry:
                             inst.label = target_name
                         self._instances[target_name] = inst
                         # Track rename so wrapper can discover it via heartbeat
-                        self._renames[old_name] = target_name
+                        self._record_rename_unlocked(old_name, target_name)
                         result = _inst_dict(inst)
 
         if error:
@@ -356,7 +357,7 @@ class RuntimeRegistry:
                     inst.color = _derive_color(base_cfg.get("color", "#888"), t_slot)
 
                 self._instances[new_name] = inst
-                self._renames[old_name] = new_name
+                self._record_rename_unlocked(old_name, new_name)
                 result = _inst_dict(inst)
 
         self._notify()
@@ -489,6 +490,11 @@ class RuntimeRegistry:
             seen = set()
             current = name
             while current in self._renames and current not in seen:
+                # Registered names are authoritative. A stale persisted
+                # old→new entry must not redirect a live instance's heartbeat
+                # to a previous slot.
+                if current in self._instances:
+                    break
                 seen.add(current)
                 current = self._renames[current]
             return current
@@ -554,6 +560,22 @@ class RuntimeRegistry:
             for k in stale:
                 del self._renames[k]
         self._save_renames()
+
+    def _mark_authoritative_unlocked(self, name: str):
+        """Drop stale outgoing rename for a name that is current again.
+
+        Caller must hold self._lock.
+        """
+        self._renames.pop(name, None)
+
+    def _record_rename_unlocked(self, old_name: str, new_name: str):
+        """Record old→new while preventing stale chains through new_name.
+
+        Caller must hold self._lock.
+        """
+        self._mark_authoritative_unlocked(new_name)
+        if old_name != new_name:
+            self._renames[old_name] = new_name
 
     def _expire_reserved(self):
         """Remove expired reservations. Must hold lock."""
