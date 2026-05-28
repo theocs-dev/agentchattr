@@ -435,7 +435,7 @@ api_key_env = "MINIMAX_API_KEY"
 temperature = 1.0
 
 [routing]
-default = "none"            # "none" = only @mentions trigger agents
+default = "all"             # "all" = messages without @mentions trigger all agents
 max_agent_hops = 4          # pause after N agent-to-agent messages
 
 [mcp]

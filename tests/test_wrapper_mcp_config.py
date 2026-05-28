@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from wrapper import _write_json_mcp_settings  # noqa: E402
+from wrapper import _build_arg_parser, _write_json_mcp_settings  # noqa: E402
 
 
 class JsonMcpSettingsTests(unittest.TestCase):
@@ -105,6 +105,34 @@ class ExpanduserPathTests(unittest.TestCase):
         raw = ".qwen/settings.json"
         expanded = Path(raw).expanduser()
         self.assertFalse(expanded.is_absolute())
+
+
+class WrapperArgumentTests(unittest.TestCase):
+    def test_cwd_override_is_consumed_by_wrapper(self):
+        parser = _build_arg_parser(["claude", "codex"])
+
+        args, extra = parser.parse_known_args([
+            "claude",
+            "--cwd",
+            "/Users/theocs/IPCRA",
+            "--dangerously-skip-permissions",
+        ])
+
+        self.assertEqual(args.cwd, "/Users/theocs/IPCRA")
+        self.assertEqual(extra, ["--dangerously-skip-permissions"])
+
+    def test_cwd_after_separator_remains_agent_argument(self):
+        parser = _build_arg_parser(["claude", "codex"])
+
+        args, extra = parser.parse_known_args([
+            "claude",
+            "--",
+            "--cwd",
+            "/tmp/agent-owned",
+        ])
+
+        self.assertIsNone(args.cwd)
+        self.assertEqual(extra, ["--cwd", "/tmp/agent-owned"])
 
 
 if __name__ == "__main__":
