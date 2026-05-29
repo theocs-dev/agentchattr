@@ -15,30 +15,30 @@ label = "Claude"
 fast_mode_default = true
 
 [agents.claude.profiles.max]
-label = "Opus 4.7 Max"
-model = "opus"
+label = "Opus 4.8 Max"
+model = "claude-opus-4-8"
 reasoning = "max"
 context_limit = 1000000
 args = ["--permission-mode", "auto"]
 default = true
 
 [agents.claude.profiles.xhigh]
-label = "Opus 4.7 XHigh"
-model = "opus"
+label = "Opus 4.8 XHigh"
+model = "claude-opus-4-8"
 reasoning = "xhigh"
 context_limit = 1000000
 args = ["--permission-mode", "auto"]
 
 [agents.claude.profiles.high]
-label = "Opus 4.7 High"
-model = "opus"
+label = "Opus 4.8 High"
+model = "claude-opus-4-8"
 reasoning = "high"
 context_limit = 1000000
 args = ["--permission-mode", "auto"]
 
 [agents.claude.profiles.low]
-label = "Opus 4.7 Low"
-model = "opus"
+label = "Opus 4.8 Low"
+model = "claude-opus-4-8"
 reasoning = "low"
 context_limit = 1000000
 args = ["--permission-mode", "auto"]

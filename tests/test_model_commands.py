@@ -77,8 +77,8 @@ class ModelCommandParsingTests(unittest.TestCase):
                     "fast_mode_default": True,
                     "profiles": {
                         "xhigh": {
-                            "label": "Opus 4.7 XHigh",
-                            "model": "opus",
+                            "label": "Opus 4.8 XHigh",
+                            "model": "claude-opus-4-8",
                             "reasoning": "xhigh",
                             "context_limit": 1000000,
                             "default": True,
