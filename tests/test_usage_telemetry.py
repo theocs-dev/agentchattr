@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import unittest
@@ -15,13 +16,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import wrapper as wrapper_module  # noqa: E402
 from wrapper import (  # noqa: E402
+    ClaudeSessionState,
     _build_profile_args,
     _find_codex_rollout_file,
     _looks_like_permission_prompt,
     _parse_claude_usage_lines,
     _parse_codex_usage_lines,
     _profile_claude_session_id,
+    _usage_monitor,
 )
 from wrapper_unix import (  # noqa: E402
     _build_agent_cmd,
@@ -253,6 +257,27 @@ class PermissionPromptTests(unittest.TestCase):
 
 
 class ClaudeTerminalRecoveryTests(unittest.TestCase):
+    def _claude_usage_line(self, tokens: int) -> str:
+        return json.dumps({
+            "type": "assistant",
+            "message": {
+                "usage": {
+                    "input_tokens": tokens,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 1,
+                },
+            },
+        }) + "\n"
+
+    def _wait_for(self, predicate, timeout: float = 2.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        self.fail("timed out waiting for usage monitor event")
+
     def test_detects_claude_thinking_block_api_error(self):
         text = (
             "API Error: 400 messages.1.content.9: `thinking` or "
@@ -306,6 +331,57 @@ class ClaudeTerminalRecoveryTests(unittest.TestCase):
 
         self.assertIn(new_id, command)
         self.assertNotIn(old_id, command)
+
+    def test_usage_monitor_repoints_after_claude_session_revision_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_id = str(uuid.uuid4())
+            new_id = str(uuid.uuid4())
+            (root / f"{old_id}.jsonl").write_text(self._claude_usage_line(100), "utf-8")
+
+            events: list[dict] = []
+            stop_event = threading.Event()
+            state = ClaudeSessionState(old_id)
+            original_report = wrapper_module._report_usage_event
+            wrapper_module._report_usage_event = (
+                lambda _port, _token, payload: events.append(dict(payload))
+            )
+            thread = threading.Thread(
+                target=_usage_monitor,
+                args=("claude", root, 12345, lambda: "token"),
+                kwargs={
+                    "claude_session_state": state,
+                    "poll_interval": 0.01,
+                    "stop_event": stop_event,
+                    "claude_session_roots": [root],
+                },
+                daemon=True,
+            )
+
+            try:
+                thread.start()
+                self._wait_for(lambda: len(events) >= 1)
+                self.assertEqual(events[-1]["status"], "ok")
+                self.assertEqual(events[-1]["used_tokens"], 100)
+
+                first_generation_events = len(events)
+                state.set_session_id(new_id)
+                self._wait_for(lambda: len(events) > first_generation_events)
+                self.assertEqual(events[-1]["status"], "unavailable")
+                self.assertEqual(events[-1]["reason"], "session jsonl not found")
+
+                unavailable_events = len(events)
+                (root / f"{new_id}.jsonl").write_text(self._claude_usage_line(7), "utf-8")
+                self._wait_for(
+                    lambda: len(events) > unavailable_events
+                    and events[-1].get("used_tokens") == 7
+                )
+
+                self.assertFalse(any(event.get("used_tokens") == 100 for event in events[1:]))
+            finally:
+                stop_event.set()
+                thread.join(timeout=0.5)
+                wrapper_module._report_usage_event = original_report
 
 
 if __name__ == "__main__":

@@ -460,6 +460,26 @@ def _profile_claude_session_id(args: list[str]) -> str | None:
     return None
 
 
+class ClaudeSessionState:
+    """Thread-safe Claude session pointer shared by runtime and usage telemetry."""
+
+    def __init__(self, session_id: str | None = None):
+        self._lock = threading.Lock()
+        self._session_id = session_id
+        self._session_revision = 0
+
+    def snapshot(self) -> tuple[str | None, int]:
+        with self._lock:
+            return self._session_id, self._session_revision
+
+    def set_session_id(self, session_id: str | None) -> int:
+        with self._lock:
+            if session_id != self._session_id:
+                self._session_id = session_id
+                self._session_revision += 1
+            return self._session_revision
+
+
 def _safe_int(value) -> int:
     if isinstance(value, bool):
         return 0
@@ -686,18 +706,41 @@ def _report_usage_event(server_port: int, token: str, payload: dict) -> None:
         pass
 
 
-def _usage_monitor(agent: str, project_dir: Path, server_port: int, get_token_fn,
-                   *, claude_session_id: str | None = None, started_at: float | None = None):
+def _usage_monitor(
+    agent: str,
+    project_dir: Path,
+    server_port: int,
+    get_token_fn,
+    *,
+    claude_session_id: str | None = None,
+    claude_session_state: ClaudeSessionState | None = None,
+    started_at: float | None = None,
+    poll_interval: float = 5.0,
+    stop_event: threading.Event | None = None,
+    claude_session_roots: list[Path] | None = None,
+):
     source_path: Path | None = None
     last_sent = ""
     reported_unavailable = False
+    seen_claude_session_revision: int | None = None
     started_at = started_at or time.time()
-    while True:
-        time.sleep(5)
+    while stop_event is None or not stop_event.is_set():
+        if stop_event is None:
+            time.sleep(poll_interval)
+        elif stop_event.wait(poll_interval):
+            break
         payload = None
         if agent == "claude":
-            if source_path is None and claude_session_id:
-                source_path = _find_claude_session_file(claude_session_id)
+            current_session_id = claude_session_id
+            if claude_session_state is not None:
+                current_session_id, current_revision = claude_session_state.snapshot()
+                if current_revision != seen_claude_session_revision:
+                    source_path = None
+                    last_sent = ""
+                    reported_unavailable = False
+                    seen_claude_session_revision = current_revision
+            if source_path is None and current_session_id:
+                source_path = _find_claude_session_file(current_session_id, roots=claude_session_roots)
             if source_path:
                 payload = _parse_claude_usage_lines(_tail_lines(source_path))
             elif not reported_unavailable:
@@ -1290,12 +1333,18 @@ def main():
 
     threading.Thread(target=_activity_monitor, daemon=True).start()
 
+    claude_session_state = (
+        ClaudeSessionState(_profile_claude_session_id(launch_args))
+        if agent == "claude"
+        else None
+    )
+
     if agent in {"claude", "codex"}:
         threading.Thread(
             target=_usage_monitor,
             args=(agent, project_dir, server_port, get_token),
             kwargs={
-                "claude_session_id": _profile_claude_session_id(launch_args),
+                "claude_session_state": claude_session_state,
                 "started_at": time.time(),
             },
             daemon=True,
@@ -1331,6 +1380,7 @@ def main():
         pid_holder=_agent_pid,
         inject_env=inject_env,
         inject_delay=agent_cfg.get("inject_delay", 0.3),
+        claude_session_state=claude_session_state,
     )
     # Windows-only injection tuning (no-op on other platforms).
     if sys.platform == "win32":
