@@ -30,6 +30,23 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent
 
+API_REGISTRATION_CAPABILITIES = {
+    "transport": "api",
+    "terminal_injectable": False,
+    "clear_supported": False,
+    "clear_strategy": "not_applicable",
+    "clear_confirmation": "none",
+    "clear_state": {
+        "state": "not_applicable",
+        "reason": "stateless_chat_replay",
+    },
+    "clear_reason": "stateless_chat_replay",
+}
+
+
+def _register_api_instance(register_instance, server_port: int, agent: str, label: str | None = None) -> dict:
+    return register_instance(server_port, agent, label, **API_REGISTRATION_CAPABILITIES)
+
 
 def _auth_headers(token: str, *, include_json: bool = False) -> dict[str, str]:
     headers = {"Authorization": f"Bearer {token}"}
@@ -101,7 +118,7 @@ def main():
 
     # Register with server
     try:
-        registration = _register_instance(server_port, agent, args.label)
+        registration = _register_api_instance(_register_instance, server_port, agent, args.label)
     except Exception as exc:
         print(f"  Registration failed ({exc}).")
         print("  Is the server running? Start it with: python run.py")
@@ -159,7 +176,7 @@ def main():
             except urllib.error.HTTPError as exc:
                 if exc.code == 409:
                     try:
-                        replacement = _register_instance(server_port, agent, args.label)
+                        replacement = _register_api_instance(_register_instance, server_port, agent, args.label)
                         set_identity(replacement["name"], replacement["token"])
                         print(f"  Re-registered as: {replacement['name']}")
                     except Exception:

@@ -746,6 +746,11 @@ def _usage_monitor(
             elif not reported_unavailable:
                 payload = _usage_unavailable("claude", "session jsonl not found")
                 reported_unavailable = True
+            if payload:
+                if current_session_id:
+                    payload["session_ref"] = current_session_id
+                if seen_claude_session_revision is not None:
+                    payload["generation"] = seen_claude_session_revision
         elif agent == "codex":
             if source_path is None:
                 source_path = _find_codex_rollout_file(project_dir, started_at)
@@ -763,10 +768,39 @@ def _usage_monitor(
         _report_usage_event(server_port, get_token_fn(), payload)
 
 
-def _register_instance(server_port: int, base: str, label: str | None = None) -> dict:
+def _register_instance(
+    server_port: int,
+    base: str,
+    label: str | None = None,
+    *,
+    transport: str | None = None,
+    terminal_injectable: bool | None = None,
+    clear_supported: bool = False,
+    clear_strategy: str = "unsupported",
+    clear_confirmation: str = "none",
+    clear_state: dict | None = None,
+    clear_reason: str | None = None,
+) -> dict:
     import urllib.request
 
-    reg_body = json.dumps({"base": base, "label": label}).encode()
+    if transport is None:
+        transport = "windows_console" if sys.platform == "win32" else "tmux"
+    if terminal_injectable is None:
+        terminal_injectable = True
+    payload = {
+        "base": base,
+        "label": label,
+        "transport": transport,
+        "terminal_injectable": terminal_injectable,
+        "clear_supported": clear_supported,
+        "clear_strategy": clear_strategy,
+        "clear_confirmation": clear_confirmation,
+    }
+    if clear_state is not None:
+        payload["clear_state"] = clear_state
+    if clear_reason:
+        payload["clear_reason"] = clear_reason
+    reg_body = json.dumps(payload).encode()
     reg_req = urllib.request.Request(
         f"http://127.0.0.1:{server_port}/api/register",
         method="POST",

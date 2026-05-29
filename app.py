@@ -22,7 +22,12 @@ from jobs import JobStore
 from schedules import ScheduleStore, parse_schedule_spec
 from router import Router
 from agents import AgentTrigger
-from registry import RuntimeRegistry
+from registry import (
+    CLEAR_CONFIRMATIONS,
+    CLEAR_STATES,
+    CLEAR_STRATEGIES,
+    RuntimeRegistry,
+)
 from session_store import SessionStore, validate_session_template
 from session_engine import SessionEngine
 
@@ -384,6 +389,46 @@ def _resolve_authenticated_agent(request: Request) -> dict | None:
     return registry.resolve_token(token)
 
 
+def _safe_opaque_event_value(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value[:256]
+    if isinstance(value, (int, float, bool)):
+        return value
+    try:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return None
+    if len(encoded) > 512:
+        return None
+    return value
+
+
+def _generation_fingerprint(payload: dict | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    parts = {
+        key: payload[key]
+        for key in ("generation", "session_ref")
+        if key in payload and payload[key] is not None
+    }
+    if not parts:
+        return None
+    try:
+        return json.dumps(parts, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return str(parts)
+
+
+def _is_cleared_usage_snapshot(snapshot: dict | None) -> bool:
+    return (
+        isinstance(snapshot, dict)
+        and snapshot.get("status") == "unavailable"
+        and str(snapshot.get("reason", "")).lower().startswith("cleared;")
+    )
+
+
 # --- Security middleware ---
 # Paths that don't require the session token (public assets).
 _PUBLIC_PREFIXES = ("/", "/static/")
@@ -428,10 +473,10 @@ def _install_security_middleware(token: str, cfg: dict):
                 )
 
             # --- Token check ---
-            # Allow registered agents to authenticate via Bearer token
-            # for /api/messages and /api/send (no browser session needed).
+            # Allow registered agents to authenticate via Bearer token for
+            # agent-owned endpoints (no browser session needed).
             auth_header = request.headers.get("authorization", "")
-            if auth_header.lower().startswith("bearer ") and (path in ("/api/messages", "/api/send", "/api/terminal_event", "/api/usage_event") or path.startswith("/api/rules/")):
+            if auth_header.lower().startswith("bearer ") and (path in ("/api/messages", "/api/send", "/api/terminal_event", "/api/usage_event", "/api/clear_event") or path.startswith("/api/rules/")):
                 bearer = auth_header[7:].strip()
                 if _self.registry and _self.registry.resolve_token(bearer):
                     return await call_next(request)
@@ -2454,7 +2499,17 @@ async def register_agent(request: Request):
     label = body.get("label")
     if not base:
         return JSONResponse({"error": "base is required"}, status_code=400)
-    result = registry.register(base, label)
+    result = registry.register(
+        base,
+        label,
+        transport=body.get("transport"),
+        terminal_injectable=body.get("terminal_injectable"),
+        clear_supported=body.get("clear_supported"),
+        clear_strategy=body.get("clear_strategy"),
+        clear_confirmation=body.get("clear_confirmation"),
+        clear_state=body.get("clear_state"),
+        clear_reason=body.get("clear_reason"),
+    )
     if result is None:
         return JSONResponse({"error": f"unknown base: {base}"}, status_code=400)
     usage_snapshots.pop(result["name"], None)
@@ -2534,6 +2589,10 @@ async def usage_event(request: Request):
         "provider": provider,
         "updated_at": int(body.get("updated_at", 0) or 0),
     }
+    for key in ("generation", "session_ref"):
+        opaque_value = _safe_opaque_event_value(body.get(key))
+        if opaque_value is not None:
+            snapshot[key] = opaque_value
     if snapshot["status"] == "ok":
         used_tokens = body.get("used_tokens")
         if not isinstance(used_tokens, int) or isinstance(used_tokens, bool) or used_tokens < 0:
@@ -2546,10 +2605,58 @@ async def usage_event(request: Request):
         reason = str(body.get("reason", "usage unavailable")).strip()
         snapshot["reason"] = reason[:160]
 
+    current_snapshot = usage_snapshots.get(auth_inst["name"])
+    if snapshot["status"] == "ok" and _is_cleared_usage_snapshot(current_snapshot):
+        current_generation = _generation_fingerprint(current_snapshot)
+        incoming_generation = _generation_fingerprint(snapshot)
+        if current_generation and incoming_generation != current_generation:
+            return JSONResponse({"ok": True, "ignored": True, "reason": "stale_generation"})
+
     usage_snapshots[auth_inst["name"]] = snapshot
     if _event_loop:
         asyncio.run_coroutine_threadsafe(broadcast_status(), _event_loop)
     return JSONResponse({"ok": True})
+
+
+@app.post("/api/clear_event")
+async def clear_event(request: Request):
+    """Wrapper reports its authoritative clear state for its own instance."""
+    auth_inst = _resolve_authenticated_agent(request)
+    if not auth_inst:
+        return JSONResponse({"error": "authenticated agent session required"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    state = str(body.get("state", "")).strip().lower()
+    if state not in CLEAR_STATES:
+        return JSONResponse({"error": "invalid clear state"}, status_code=400)
+
+    strategy = str(body.get("strategy", auth_inst.get("clear_strategy", "unsupported"))).strip().lower()
+    if strategy not in CLEAR_STRATEGIES:
+        return JSONResponse({"error": "invalid clear strategy"}, status_code=400)
+
+    confirmation = str(body.get("confirmation", auth_inst.get("clear_confirmation", "none"))).strip().lower()
+    if confirmation not in CLEAR_CONFIRMATIONS:
+        return JSONResponse({"error": "invalid clear confirmation"}, status_code=400)
+
+    generation = _safe_opaque_event_value(body.get("generation"))
+    session_ref = _safe_opaque_event_value(body.get("session_ref"))
+    result = registry.update_clear_state(
+        auth_inst["name"],
+        state=state,
+        strategy=strategy,
+        confirmation=confirmation,
+        reason=str(body.get("reason", "")).strip(),
+        generation=generation,
+        session_ref=session_ref,
+        requested_at=body.get("requested_at"),
+        updated_at=body.get("updated_at"),
+    )
+    if result is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse({"ok": True, "clear_state": result.get("clear_state", {})})
 
 
 @app.post("/api/deregister/{name}")

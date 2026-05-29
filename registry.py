@@ -16,6 +16,118 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+TRANSPORTS = {"unknown", "tmux", "windows_console", "api"}
+CLEAR_STRATEGIES = {
+    "unsupported",
+    "not_applicable",
+    "app_state_reset",
+    "cli_command",
+    "session_restart",
+}
+CLEAR_CONFIRMATIONS = {
+    "none",
+    "wrapper_machine",
+    "session_generation",
+    "heuristic_only",
+}
+CLEAR_STATES = {"not_applicable", "pending", "confirmed", "failed", "not_supported"}
+
+
+def _safe_enum(value, allowed: set[str], default: str) -> str:
+    candidate = str(value or "").strip().lower()
+    return candidate if candidate in allowed else default
+
+
+def _safe_bool(value, default: bool = False) -> bool:
+    return value if isinstance(value, bool) else default
+
+
+def _initial_clear_state(strategy: str, reason: str | None = None) -> dict:
+    strategy = _safe_enum(strategy, CLEAR_STRATEGIES, "unsupported")
+    if strategy == "not_applicable":
+        state = "not_applicable"
+        default_reason = "not_applicable"
+    else:
+        state = "not_supported"
+        default_reason = "clear_not_supported"
+    return {
+        "state": state,
+        "reason": (reason or default_reason)[:160],
+        "requested_at": None,
+        "updated_at": int(time.time()),
+    }
+
+
+def _safe_time(value, default=None):
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)) and value >= 0:
+        return value
+    return default
+
+
+def _normalize_clear_state(raw, *, strategy: str, reason: str | None = None) -> dict:
+    if not isinstance(raw, dict):
+        return _initial_clear_state(strategy, reason)
+
+    fallback = _initial_clear_state(strategy, reason)
+    state = _safe_enum(raw.get("state"), CLEAR_STATES, fallback["state"])
+    normalized = {
+        "state": state,
+        "reason": str(raw.get("reason") or fallback["reason"]).strip()[:160],
+        "requested_at": _safe_time(raw.get("requested_at"), fallback["requested_at"]),
+        "updated_at": _safe_time(raw.get("updated_at"), int(time.time())),
+    }
+    for key in ("generation", "session_ref"):
+        if key in raw and raw[key] is not None:
+            normalized[key] = raw[key]
+    return normalized
+
+
+def normalize_instance_capabilities(
+    *,
+    transport=None,
+    terminal_injectable=None,
+    clear_supported=None,
+    clear_strategy=None,
+    clear_confirmation=None,
+    clear_state=None,
+    clear_reason=None,
+) -> dict:
+    """Normalize wrapper-declared runtime capabilities to conservative values."""
+    normalized_transport = _safe_enum(transport, TRANSPORTS, "unknown")
+    normalized_strategy = _safe_enum(clear_strategy, CLEAR_STRATEGIES, "unsupported")
+    normalized_confirmation = _safe_enum(clear_confirmation, CLEAR_CONFIRMATIONS, "none")
+
+    injectable = _safe_bool(terminal_injectable, False)
+    if normalized_transport == "unknown":
+        injectable = False
+
+    supported = _safe_bool(clear_supported, False)
+    if normalized_strategy in ("unsupported", "not_applicable"):
+        supported = False
+
+    normalized_state = _normalize_clear_state(
+        clear_state,
+        strategy=normalized_strategy,
+        reason=str(clear_reason).strip() if clear_reason else None,
+    )
+    if normalized_strategy in ("unsupported", "not_applicable"):
+        normalized_state = _initial_clear_state(
+            normalized_strategy,
+            str(clear_reason).strip() if clear_reason else None,
+        )
+
+    return {
+        "transport": normalized_transport,
+        "terminal_injectable": injectable,
+        "clear_supported": supported,
+        "clear_strategy": normalized_strategy,
+        "clear_confirmation": normalized_confirmation,
+        "clear_state": normalized_state,
+    }
+
+
 @dataclass
 class Instance:
     """A live agent instance."""
@@ -29,6 +141,12 @@ class Instance:
     epoch: int = 1
     state: str = "pending"   # "pending" | "active"
     registered_at: float = field(default_factory=time.time)
+    transport: str = "unknown"
+    terminal_injectable: bool = False
+    clear_supported: bool = False
+    clear_strategy: str = "unsupported"
+    clear_confirmation: str = "none"
+    clear_state: dict = field(default_factory=lambda: _initial_clear_state("unsupported"))
 
 
 class RuntimeRegistry:
@@ -90,7 +208,19 @@ class RuntimeRegistry:
 
     # --- Registration ---
 
-    def register(self, base: str, label: str | None = None) -> dict | None:
+    def register(
+        self,
+        base: str,
+        label: str | None = None,
+        *,
+        transport=None,
+        terminal_injectable=None,
+        clear_supported=None,
+        clear_strategy=None,
+        clear_confirmation=None,
+        clear_state=None,
+        clear_reason=None,
+    ) -> dict | None:
         """Register a new instance of `base`. Returns slot info or None if unknown base.
 
         When a 2nd instance registers, slot 1 is renamed from 'base' to 'base-1'
@@ -146,7 +276,24 @@ class RuntimeRegistry:
             # recovery/reclaim still uses chat_claim, but normal startup should
             # not block on a manual confirmation step.
             state = "active"
-            inst = Instance(name=name, base=base, slot=slot, label=lbl, color=color, state=state)
+            caps = normalize_instance_capabilities(
+                transport=transport,
+                terminal_injectable=terminal_injectable,
+                clear_supported=clear_supported,
+                clear_strategy=clear_strategy,
+                clear_confirmation=clear_confirmation,
+                clear_state=clear_state,
+                clear_reason=clear_reason,
+            )
+            inst = Instance(
+                name=name,
+                base=base,
+                slot=slot,
+                label=lbl,
+                color=color,
+                state=state,
+                **caps,
+            )
             self._mark_authoritative_unlocked(name)
             self._instances[name] = inst
             result = _inst_dict(inst, include_token=True)
@@ -389,10 +536,21 @@ class RuntimeRegistry:
             return {n: _inst_dict(i) for n, i in self._instances.items()}
 
     def get_agent_config(self) -> dict[str, dict]:
-        """For WebSocket 'agents' message: {name: {color, label, base, state}}."""
+        """For WebSocket 'agents' message: display metadata plus capabilities."""
         with self._lock:
             return {
-                n: {"color": i.color, "label": i.label, "base": i.base, "state": i.state}
+                n: {
+                    "color": i.color,
+                    "label": i.label,
+                    "base": i.base,
+                    "state": i.state,
+                    "transport": i.transport,
+                    "terminal_injectable": i.terminal_injectable,
+                    "clear_supported": i.clear_supported,
+                    "clear_strategy": i.clear_strategy,
+                    "clear_confirmation": i.clear_confirmation,
+                    "clear_state": dict(i.clear_state),
+                }
                 for n, i in self._instances.items()
             }
 
@@ -516,6 +674,47 @@ class RuntimeRegistry:
                     return _inst_dict(inst)
         return None
 
+    def update_clear_state(
+        self,
+        name: str,
+        *,
+        state: str,
+        strategy: str | None = None,
+        confirmation: str | None = None,
+        reason: str = "",
+        generation=None,
+        session_ref=None,
+        requested_at=None,
+        updated_at=None,
+    ) -> dict | None:
+        with self._lock:
+            inst = self._instances.get(name)
+            if not inst:
+                return None
+
+            if strategy is not None:
+                inst.clear_strategy = _safe_enum(strategy, CLEAR_STRATEGIES, "unsupported")
+            if confirmation is not None:
+                inst.clear_confirmation = _safe_enum(confirmation, CLEAR_CONFIRMATIONS, "none")
+            state = _safe_enum(state, CLEAR_STATES, _initial_clear_state(inst.clear_strategy)["state"])
+
+            now = int(time.time())
+            clear_state = {
+                "state": state,
+                "reason": str(reason or state).strip()[:160],
+                "requested_at": _safe_time(requested_at, now),
+                "updated_at": _safe_time(updated_at, now),
+            }
+            if generation is not None:
+                clear_state["generation"] = generation
+            if session_ref is not None:
+                clear_state["session_ref"] = session_ref
+            inst.clear_state = clear_state
+            result = _inst_dict(inst)
+
+        self._notify()
+        return result
+
     def get_pending(self) -> list[dict]:
         """All pending instances (for timeout checks)."""
         with self._lock:
@@ -593,6 +792,12 @@ def _inst_dict(inst: Instance, include_token: bool = False) -> dict:
         "label": inst.label, "color": inst.color, "state": inst.state,
         "epoch": inst.epoch,
         "registered_at": inst.registered_at,
+        "transport": inst.transport,
+        "terminal_injectable": inst.terminal_injectable,
+        "clear_supported": inst.clear_supported,
+        "clear_strategy": inst.clear_strategy,
+        "clear_confirmation": inst.clear_confirmation,
+        "clear_state": dict(inst.clear_state),
     }
     if include_token:
         d["token"] = inst.token

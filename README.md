@@ -230,7 +230,7 @@ Type `/` in the input to open a Slack-style autocomplete menu:
 
 - `/summary @agent` — ask an agent to summarize recent messages in the current channel
 - `/continue` — resume after the loop guard pauses an agent-to-agent chain
-- `/clear` — clear messages in the current channel
+- `/clear` — clear chat messages in the current channel only; terminal agent context is reported separately and is not cleared by this command
 
 ### Fun stuff
 Slash commands for when you want to see what your agents are made of:
