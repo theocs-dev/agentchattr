@@ -20,10 +20,17 @@ class AgentTrigger:
         instances = self._registry.get_all()
         return {
             name: {
+                "registered": True,
                 "available": is_online(name),
                 "busy": is_active(name),
                 "label": info["label"],
                 "color": info["color"],
+                "transport": info.get("transport", "unknown"),
+                "terminal_injectable": bool(info.get("terminal_injectable", False)),
+                "clear_supported": bool(info.get("clear_supported", False)),
+                "clear_strategy": info.get("clear_strategy", "unsupported"),
+                "clear_confirmation": info.get("clear_confirmation", "none"),
+                "clear_state": info.get("clear_state", {}),
                 "role": get_role(name),
             }
             for name, info in instances.items()

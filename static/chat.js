@@ -985,6 +985,7 @@ function applyAgentConfig(data) {
     recolorMessages();
     updateJobReplyTargetUI();
     updateTokenMeters();
+    updateClearChatButtonCopy();
 }
 
 function recolorMessages() {
@@ -1212,6 +1213,13 @@ function getFastModeLabel(cfg) {
     return cfg.fast_mode.enabled ? 'Fast' : 'Standard';
 }
 
+function getClearCapabilityLabel(cfg) {
+    const clearState = cfg?.clear_state?.state || (cfg?.clear_supported ? 'pending' : 'not_supported');
+    if (cfg?.clear_supported) return `terminal clear ${clearState}`;
+    if (clearState === 'not_applicable') return 'terminal clear not applicable';
+    return 'terminal clear not supported';
+}
+
 function buildAgentProfileSettings() {
     const bases = ['claude', 'codex'];
     for (const base of bases) {
@@ -1336,7 +1344,8 @@ function updateTokenMeters() {
         const usageText = ok && limit
             ? `${formatTokenCount(used)} / ${formatTokenCount(limit)}`
             : 'usage unavailable';
-        pill.title = `@${name} · ${model} · ${reasoning}${fastLabel ? ` · ${fastLabel}` : ''} · ${usageText}`;
+        const clearText = getClearCapabilityLabel(cfg);
+        pill.title = `@${name} · ${model} · ${reasoning}${fastLabel ? ` · ${fastLabel}` : ''} · ${usageText} · ${clearText}`;
     }
 }
 window.updateTokenMeters = updateTokenMeters;
@@ -1897,9 +1906,17 @@ function updateStatus(data) {
 
         if (agentConfig[name]) {
             agentConfig[name].usage = info.usage || null;
+            agentConfig[name].registered = !!info.registered;
+            agentConfig[name].transport = info.transport || agentConfig[name].transport || 'unknown';
+            agentConfig[name].terminal_injectable = !!info.terminal_injectable;
+            agentConfig[name].clear_supported = !!info.clear_supported;
+            agentConfig[name].clear_strategy = info.clear_strategy || 'unsupported';
+            agentConfig[name].clear_confirmation = info.clear_confirmation || 'none';
+            agentConfig[name].clear_state = info.clear_state || agentConfig[name].clear_state || {};
         }
     }
     updateTokenMeters();
+    updateClearChatButtonCopy();
 }
 
 function updateTyping(agent, active) {
@@ -1993,8 +2010,9 @@ function _clearClearChatConfirm() {
     const confirmEl = document.getElementById('clear-chat-confirm');
     if (confirmEl) confirmEl.remove();
     if (btn) {
-        btn.textContent = 'Clear Chat';
+        btn.textContent = 'Clear Chat Only';
         btn.classList.remove('confirming');
+        updateClearChatButtonCopy();
     }
     document.removeEventListener('click', _clearChatOutsideClick, true);
 }
@@ -2023,8 +2041,9 @@ function clearChat() {
         return;
     }
 
-    btn.textContent = 'Clear Chat?';
+    btn.textContent = 'Clear Chat Only?';
     btn.classList.add('confirming');
+    updateClearChatButtonCopy();
 
     const confirmWrap = document.createElement('span');
     confirmWrap.id = 'clear-chat-confirm';
@@ -2053,6 +2072,23 @@ function clearChat() {
     };
 
     setTimeout(() => document.addEventListener('click', _clearChatOutsideClick, true), 0);
+}
+
+function updateClearChatButtonCopy() {
+    const btn = document.getElementById('clear-chat-btn');
+    if (!btn) return;
+    if (!btn.classList.contains('confirming')) {
+        btn.textContent = 'Clear Chat Only';
+    }
+    const agents = Object.values(agentConfig || {});
+    const supported = agents.filter(cfg => !!cfg.clear_supported).length;
+    const notApplicable = agents.filter(cfg => cfg?.clear_state?.state === 'not_applicable').length;
+    const total = agents.length;
+    const terminalSummary = total
+        ? `Terminal clear support: ${supported}/${total}; not applicable: ${notApplicable}.`
+        : 'No registered agents.';
+    btn.title = `Clear chat messages in this channel only. Terminal contexts are not cleared. ${terminalSummary}`;
+    btn.setAttribute('aria-label', 'Clear chat messages only');
 }
 
 function saveSettings() {
@@ -2263,7 +2299,7 @@ const SLASH_COMMANDS = [
     { cmd: '/model', desc: 'List or set launch profile (e.g. /model claude max, /model codex xhigh)', broadcast: false },
     { cmd: '/fast', desc: 'Toggle Claude fast mode (or use /fast on, /fast off, /fast status)', broadcast: false },
     { cmd: '/continue', desc: 'Resume after loop guard pauses', broadcast: false },
-    { cmd: '/clear', desc: 'Clear messages in current channel', broadcast: false },
+    { cmd: '/clear', desc: 'Clear chat messages in current channel only', broadcast: false },
 ];
 
 let slashMenuIndex = 0;
