@@ -21,6 +21,7 @@ tests/*
 !tests/test_usage_telemetry.py
 !tests/test_unicode_mentions.py
 !tests/test_clear_foundation.py
+!tests/test_clear_workflow_ui.py
 agents_lineup.svg
 docs/
 goals.py
