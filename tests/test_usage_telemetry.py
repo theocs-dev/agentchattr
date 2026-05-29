@@ -82,6 +82,8 @@ class ProfileArgsTests(unittest.TestCase):
 
         args = _build_profile_args("claude", config["agents"]["claude"], self.data_dir)
 
+        self.assertIn("--model", args)
+        self.assertIn("claude-opus-4-8", args)
         self.assertIn("--effort", args)
         self.assertIn("max", args)
         self.assertIn("--settings", args)

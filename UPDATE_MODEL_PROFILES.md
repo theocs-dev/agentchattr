@@ -72,19 +72,21 @@ Pour Claude :
 fast_mode_default = true
 
 [agents.claude.profiles.max]
-label = "Opus 4.7 Max"
-model = "opus"
+label = "Opus 4.8 Max"
+model = "claude-opus-4-8"
 reasoning = "max"
 args = ["--permission-mode", "auto"]
 default = true
 ```
 
 Fast mode est un setting Claude Code. D'apres la doc Anthropic, il peut etre
-active avec `/fast` ou `"fastMode": true`, fonctionne sur Opus 4.7/4.6, garde
-la qualite/capacite Opus et vise une latence plus basse avec un cout token plus
-eleve. Pre-requis critique : les usage credits doivent etre actives. Si Claude
-affiche `Fast mode requires usage credits`, le flag est bien passe au process,
-mais fast mode n'est pas encore actif et il ne repondra pas plus vite.
+active avec `/fast` ou `"fastMode": true`. D'apres la doc Anthropic, fast mode
+est disponible sur Opus 4.8, 4.7 et 4.6, garde le meme modele avec une
+configuration d'inference plus rapide, et vise jusqu'a 2,5x plus d'output tokens
+par seconde avec un cout token plus eleve. Pre-requis critique : les usage
+credits doivent etre actives. Si Claude affiche `Fast mode requires usage
+credits`, le flag est bien passe au process, mais fast mode n'est pas encore
+actif et il ne repondra pas plus vite.
 
 Ne pas cacher `fastMode` dans `profiles.max.args` si l'UI doit pouvoir
 l'activer/desactiver. Le wrapper ajoute `--settings {"fastMode":true/false}` a
@@ -255,7 +257,7 @@ ps -axww | rg 'wrapper\.py (claude|codex)|model_reasoning_effort|/Users/theocs/.
 Attendu :
 
 ```text
-claude ... --model opus --effort max ...
+claude ... --model claude-opus-4-8 --effort max ...
 codex ... --model gpt-5.5 -c model_reasoning_effort="xhigh"
 ```
 
@@ -273,7 +275,7 @@ Selon les restarts, les sessions peuvent s'appeler `agentchattr-claude-2` ou
 Attendu dans Claude :
 
 ```text
-Opus 4.7 (1M context) with max effort
+Opus 4.8 (1M context) with max effort
 ```
 
 Attendu dans Codex :
@@ -290,7 +292,7 @@ fin du startup MCP avant de conclure.
 Avec les wrappers enregistres, les pills et settings doivent montrer :
 
 ```text
-Claude · Opus 4.7 Max · Fast
+Claude · Opus 4.8 Max · Fast
 Codex · Extra High
 ```
 
@@ -350,7 +352,7 @@ Si `/fast off` a ete utilise, verifier au contraire :
 ```
 
 Puis verifier l'etat dans Claude Code avec `/fast` ou l'icone `↯`. Le header
-Claude peut continuer a afficher seulement `Opus 4.7 ... with max effort`; il ne
+Claude peut continuer a afficher seulement `Opus 4.8 ... with max effort`; il ne
 suffit donc pas a prouver que fast mode est actif. Si `/fast` affiche une demande
 d'activation des usage credits, il manque encore le pre-requis billing/org.
 
