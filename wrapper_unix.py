@@ -165,6 +165,7 @@ def run_agent(
     session_name=None,
     inject_env=None,
     inject_delay: float = 0.3,
+    claude_session_state=None,
 ):
     """Run agent inside a tmux session, inject via tmux send-keys."""
     _check_tmux()
@@ -221,6 +222,8 @@ def run_agent(
 
             if agent == "claude" and recovery_restart_requested[0]:
                 session_id = _refresh_claude_session_id(extra_args)
+                if claude_session_state is not None:
+                    claude_session_state.set_session_id(session_id)
                 recovery_restart_requested[0] = False
                 print(f"  Claude recovery: new --session-id {session_id}")
 

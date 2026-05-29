@@ -402,7 +402,23 @@ def _vt_keepalive_thread():
     t.start()
 
 
-def run_agent(command, extra_args, cwd, env, queue_file, agent, no_restart, start_watcher, strip_env=None, pid_holder=None, session_name=None, inject_env=None, inject_delay: float = 0.3, enter_backend: str = "console_input"):
+def run_agent(
+    command,
+    extra_args,
+    cwd,
+    env,
+    queue_file,
+    agent,
+    no_restart,
+    start_watcher,
+    strip_env=None,
+    pid_holder=None,
+    session_name=None,
+    inject_env=None,
+    inject_delay: float = 0.3,
+    enter_backend: str = "console_input",
+    claude_session_state=None,
+):
     """Run agent as a direct subprocess, inject via Win32 console."""
     # Newer codex/claude/etc TUIs require VT processing on the parent console;
     # without this, ANSI escape sequences leak as text into the terminal.
