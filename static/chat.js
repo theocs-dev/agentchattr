@@ -986,6 +986,7 @@ function applyAgentConfig(data) {
     updateJobReplyTargetUI();
     updateTokenMeters();
     updateClearChatButtonCopy();
+    _renderClearChatConfirm();
 }
 
 function recolorMessages() {
@@ -1214,10 +1215,89 @@ function getFastModeLabel(cfg) {
 }
 
 function getClearCapabilityLabel(cfg) {
-    const clearState = cfg?.clear_state?.state || (cfg?.clear_supported ? 'pending' : 'not_supported');
+    const clearState = getClearWorkflowState(cfg);
     if (cfg?.clear_supported) return `terminal clear ${clearState}`;
     if (clearState === 'not_applicable') return 'terminal clear not applicable';
     return 'terminal clear not supported';
+}
+
+const CLEAR_WORKFLOW_STATES = {
+    supported: { label: 'Supported', tone: 'supported' },
+    pending: { label: 'Pending', tone: 'pending' },
+    confirmed: { label: 'Confirmed', tone: 'confirmed' },
+    failed: { label: 'Failed', tone: 'failed' },
+    not_applicable: { label: 'Not applicable', tone: 'neutral' },
+    not_supported: { label: 'Not supported', tone: 'muted' },
+};
+
+function getClearWorkflowState(cfg) {
+    const state = String(cfg?.clear_state?.state || '').trim().toLowerCase();
+    if (['pending', 'confirmed', 'failed', 'not_applicable'].includes(state)) {
+        return state;
+    }
+    if (cfg?.clear_supported) return 'supported';
+    return 'not_supported';
+}
+
+function getClearWorkflowActionState(cfg) {
+    if (!cfg?.clear_supported) return 'not_requestable';
+    const state = getClearWorkflowState(cfg);
+    if (state === 'pending') return 'pending';
+    if (cfg?.busy) return 'blocked_busy';
+    return 'requires_explicit_confirmation';
+}
+
+function formatClearWorkflowReason(reason) {
+    const text = String(reason || '').trim();
+    if (!text) return '';
+    return text.replace(/_/g, ' ');
+}
+
+function getClearWorkflowAgents(config = agentConfig) {
+    return Object.entries(config || {}).map(([name, cfg]) => {
+        const state = getClearWorkflowState(cfg);
+        const def = CLEAR_WORKFLOW_STATES[state] || CLEAR_WORKFLOW_STATES.not_supported;
+        const actionState = getClearWorkflowActionState(cfg);
+        const reason = formatClearWorkflowReason(cfg?.clear_state?.reason);
+        let detail = reason;
+        if (actionState === 'blocked_busy') {
+            detail = 'Busy now; no terminal clear request is sent.';
+        } else if (state === 'supported') {
+            detail = 'Not requested by this chat clear.';
+        } else if (state === 'pending') {
+            detail = detail || 'Wrapper has not confirmed yet.';
+        } else if (state === 'confirmed') {
+            detail = detail || 'Wrapper reported clear.';
+        } else if (state === 'failed') {
+            detail = detail || 'Wrapper reported failure.';
+        } else if (state === 'not_applicable') {
+            detail = detail || 'No persistent terminal context.';
+        } else {
+            detail = detail || 'No terminal clear adapter.';
+        }
+        return {
+            name,
+            label: cfg?.label || name,
+            state,
+            stateLabel: def.label,
+            tone: def.tone,
+            detail,
+            busy: !!cfg?.busy,
+            clearSupported: !!cfg?.clear_supported,
+            actionState,
+        };
+    });
+}
+
+function getClearWorkflowSummary(rows = getClearWorkflowAgents()) {
+    return {
+        total: rows.length,
+        supported: rows.filter(row => row.clearSupported).length,
+        notApplicable: rows.filter(row => row.state === 'not_applicable').length,
+        notSupported: rows.filter(row => row.state === 'not_supported').length,
+        pending: rows.filter(row => row.state === 'pending').length,
+        busySupported: rows.filter(row => row.actionState === 'blocked_busy').length,
+    };
 }
 
 function buildAgentProfileSettings() {
@@ -1907,6 +1987,8 @@ function updateStatus(data) {
         if (agentConfig[name]) {
             agentConfig[name].usage = info.usage || null;
             agentConfig[name].registered = !!info.registered;
+            agentConfig[name].available = !!info.available;
+            agentConfig[name].busy = !!info.busy;
             agentConfig[name].transport = info.transport || agentConfig[name].transport || 'unknown';
             agentConfig[name].terminal_injectable = !!info.terminal_injectable;
             agentConfig[name].clear_supported = !!info.clear_supported;
@@ -1917,6 +1999,7 @@ function updateStatus(data) {
     }
     updateTokenMeters();
     updateClearChatButtonCopy();
+    _renderClearChatConfirm();
 }
 
 function updateTyping(agent, active) {
@@ -2012,6 +2095,7 @@ function _clearClearChatConfirm() {
     if (btn) {
         btn.textContent = 'Clear Chat Only';
         btn.classList.remove('confirming');
+        btn.setAttribute('aria-expanded', 'false');
         updateClearChatButtonCopy();
     }
     document.removeEventListener('click', _clearChatOutsideClick, true);
@@ -2026,50 +2110,84 @@ function _clearChatOutsideClick(e) {
     }
 }
 
+function _sendClearChatOnly() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'message', text: '/clear', sender: username, channel: activeChannel }));
+    }
+}
+
+function _renderClearChatConfirm() {
+    const confirmEl = document.getElementById('clear-chat-confirm');
+    if (!confirmEl) return;
+
+    const rows = getClearWorkflowAgents();
+    const summary = getClearWorkflowSummary(rows);
+    const channel = activeChannel || 'general';
+    const terminalSummary = summary.supported
+        ? `${summary.supported} terminal adapter${summary.supported === 1 ? '' : 's'} available${summary.busySupported ? `; ${summary.busySupported} busy` : ''}.`
+        : 'No terminal clear adapter available.';
+    const agentRows = rows.length
+        ? rows.map(row => `
+            <div class="clear-agent-row clear-agent-row--${row.tone}" data-state="${escapeHtml(row.state)}">
+                <span class="clear-agent-dot"></span>
+                <span class="clear-agent-main">
+                    <span class="clear-agent-name">@${escapeHtml(row.name)}</span>
+                    <span class="clear-agent-detail">${escapeHtml(row.detail)}</span>
+                </span>
+                <span class="clear-agent-state">${escapeHtml(row.stateLabel)}</span>
+            </div>
+        `).join('')
+        : '<div class="clear-empty">No registered agents.</div>';
+
+    confirmEl.innerHTML = `
+        <div class="clear-confirm-head">
+            <div>
+                <div class="clear-confirm-title">Clear #${escapeHtml(channel)}</div>
+                <div class="clear-confirm-note">Chat messages only. Terminal state stays as shown below.</div>
+            </div>
+            <button type="button" class="clear-confirm-close" title="Cancel clear" aria-label="Cancel clear">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+            </button>
+        </div>
+        <div class="clear-confirm-action">
+            <button type="button" class="clear-confirm-chat">Clear chat only</button>
+            <span>${escapeHtml(terminalSummary)}</span>
+        </div>
+        <div class="clear-agent-list" role="list" aria-label="Terminal clear status by agent">
+            ${agentRows}
+        </div>
+    `;
+
+    confirmEl.querySelector('.clear-confirm-chat').onclick = (e) => {
+        e.stopPropagation();
+        _sendClearChatOnly();
+        _clearClearChatConfirm();
+        document.getElementById('settings-bar').classList.add('hidden');
+    };
+    confirmEl.querySelector('.clear-confirm-close').onclick = (e) => {
+        e.stopPropagation();
+        _clearClearChatConfirm();
+    };
+}
+
 function clearChat() {
     const btn = document.getElementById('clear-chat-btn');
     if (!btn) return;
 
-    // Second click -> execute. First click -> inline confirm, matching the
-    // End Session pattern elsewhere.
     if (btn.classList.contains('confirming')) {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'message', text: '/clear', sender: username, channel: activeChannel }));
-        }
         _clearClearChatConfirm();
-        document.getElementById('settings-bar').classList.add('hidden');
         return;
     }
 
-    btn.textContent = 'Clear Chat Only?';
     btn.classList.add('confirming');
+    btn.setAttribute('aria-expanded', 'true');
     updateClearChatButtonCopy();
 
-    const confirmWrap = document.createElement('span');
+    const confirmWrap = document.createElement('div');
     confirmWrap.id = 'clear-chat-confirm';
-    confirmWrap.className = 'session-inline-confirm';
-    confirmWrap.innerHTML = `
-        <button class="session-inline-confirm-yes ch-confirm-yes" title="Confirm clear chat">
-            <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M3 8.5l3.5 3.5 6.5-7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>
-        <button class="session-inline-confirm-no ch-confirm-no" title="Cancel">
-            <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-        </button>
-    `;
-    btn.parentElement.insertBefore(confirmWrap, btn);
-
-    confirmWrap.querySelector('.ch-confirm-yes').onclick = (e) => {
-        e.stopPropagation();
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'message', text: '/clear', sender: username, channel: activeChannel }));
-        }
-        _clearClearChatConfirm();
-        document.getElementById('settings-bar').classList.add('hidden');
-    };
-    confirmWrap.querySelector('.ch-confirm-no').onclick = (e) => {
-        e.stopPropagation();
-        _clearClearChatConfirm();
-    };
+    confirmWrap.className = 'clear-confirm-panel';
+    btn.parentElement.insertAdjacentElement('afterend', confirmWrap);
+    _renderClearChatConfirm();
 
     setTimeout(() => document.addEventListener('click', _clearChatOutsideClick, true), 0);
 }
@@ -2080,12 +2198,9 @@ function updateClearChatButtonCopy() {
     if (!btn.classList.contains('confirming')) {
         btn.textContent = 'Clear Chat Only';
     }
-    const agents = Object.values(agentConfig || {});
-    const supported = agents.filter(cfg => !!cfg.clear_supported).length;
-    const notApplicable = agents.filter(cfg => cfg?.clear_state?.state === 'not_applicable').length;
-    const total = agents.length;
-    const terminalSummary = total
-        ? `Terminal clear support: ${supported}/${total}; not applicable: ${notApplicable}.`
+    const summary = getClearWorkflowSummary();
+    const terminalSummary = summary.total
+        ? `Terminal clear support: ${summary.supported}/${summary.total}; not applicable: ${summary.notApplicable}.`
         : 'No registered agents.';
     btn.title = `Clear chat messages in this channel only. Terminal contexts are not cleared. ${terminalSummary}`;
     btn.setAttribute('aria-label', 'Clear chat messages only');

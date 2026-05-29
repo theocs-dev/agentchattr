@@ -11,7 +11,7 @@
 |---|---|---|
 | PR0 — Bugfix télémétrie recovery Claude | Fait | Livré séparément, sans sémantique clear. |
 | PR1 — Fondation clear | Fait | Couche de vérité livrée, sans injection terminale. |
-| PR2 — Workflow UI honnête | À faire | Prochaine étape produit. |
+| PR2 — Workflow UI honnête | Fait | Confirmation UI par agent, sans action terminale. |
 | PR3 — Adaptateur Claude pilote (restart) | À faire | Inclut A1, reportée ici. |
 
 ---
@@ -146,7 +146,7 @@ Une nouvelle génération/révision de session **ne signifie jamais un clear** p
 
 ---
 
-### PR2 — Workflow UI honnête (toujours sans promesse globale) — À faire
+### PR2 — Workflow UI honnête (toujours sans promesse globale) — Fait
 **But :** rendre l'action utilisateur explicite.
 
 **Changements :**
