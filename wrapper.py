@@ -706,6 +706,21 @@ def _report_usage_event(server_port: int, token: str, payload: dict) -> None:
         pass
 
 
+def _report_clear_event(server_port: int, token: str, payload: dict) -> None:
+    try:
+        import urllib.request
+        body = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{server_port}/api/clear_event",
+            method="POST",
+            data=body,
+            headers=_auth_headers(token, include_json=True),
+        )
+        urllib.request.urlopen(req, timeout=3)
+    except Exception:
+        pass
+
+
 def _usage_monitor(
     agent: str,
     project_dir: Path,
@@ -816,6 +831,26 @@ def _auth_headers(token: str, *, include_json: bool = False) -> dict[str, str]:
     if include_json:
         headers["Content-Type"] = "application/json"
     return headers
+
+
+def _clear_capability_for(agent: str, agent_cfg: dict) -> dict:
+    enabled = agent_cfg.get("clear_supported") is True
+    strategy = str(
+        agent_cfg.get("clear_context_strategy")
+        or agent_cfg.get("clear_strategy")
+        or "unsupported"
+    ).strip().lower()
+    if enabled and agent == "claude" and sys.platform != "win32" and strategy == "session_restart":
+        return {
+            "clear_supported": True,
+            "clear_strategy": "session_restart",
+            "clear_confirmation": "wrapper_machine",
+        }
+    return {
+        "clear_supported": False,
+        "clear_strategy": "unsupported",
+        "clear_confirmation": "none",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1054,6 +1089,58 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
         time.sleep(1)
 
 
+def _parse_action_lines(lines: list[str]) -> list[dict]:
+    """Parse wrapper action JSONL records, accepting only known action types."""
+    actions: list[dict] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("type") != "clear_context":
+            continue
+        action = dict(data)
+        action["strategy"] = str(action.get("strategy") or "session_restart").strip().lower()
+        actions.append(action)
+    return actions
+
+
+def _drain_action_file(action_file: Path) -> list[dict]:
+    if not action_file.exists() or action_file.stat().st_size <= 0:
+        return []
+    try:
+        with open(action_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        action_file.write_text("", "utf-8")
+    except Exception:
+        return []
+    return _parse_action_lines(lines)
+
+
+def _action_watcher_step(get_identity_fn, data_dir: Path, handle_action_fn) -> int:
+    current_name, _ = get_identity_fn()
+    action_file = data_dir / f"{current_name}_actions.jsonl"
+    actions = _drain_action_file(action_file)
+    for action in actions:
+        handle_action_fn(action)
+    return len(actions)
+
+
+def _action_watcher(get_identity_fn, data_dir: Path, handle_action_fn):
+    """Poll the action queue. Actions are never converted into prompt injection."""
+    while True:
+        try:
+            _action_watcher_step(get_identity_fn, data_dir, handle_action_fn)
+        except Exception:
+            pass
+        time.sleep(1)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1063,7 +1150,14 @@ def _build_arg_parser(agent_names: list[str]) -> "argparse.ArgumentParser":
 
     parser = argparse.ArgumentParser(description="Agent wrapper with chat auto-trigger")
     parser.add_argument("agent", choices=agent_names, help=f"Agent to wrap ({', '.join(agent_names)})")
-    parser.add_argument("--no-restart", action="store_true", help="Do not restart on exit")
+    parser.add_argument(
+        "--no-restart",
+        action="store_true",
+        help=(
+            "Do not restart after normal agent exit; explicit clears still restart, "
+            "Claude auto-recovery is blocked and reported"
+        ),
+    )
     parser.add_argument("--label", type=str, default=None, help="Custom display label")
     parser.add_argument("--cwd", type=str, default=None, help="Override the agent working directory for this launch")
     # Per-project isolation flags (must match the server's flags so wrappers
@@ -1102,8 +1196,9 @@ def main():
     server_port = config.get("server", {}).get("port", 8300)
     mcp_cfg = config.get("mcp", {})
 
+    clear_capability = _clear_capability_for(agent, agent_cfg)
     try:
-        registration = _register_instance(server_port, agent, args.label)
+        registration = _register_instance(server_port, agent, args.label, **clear_capability)
     except Exception as exc:
         print(f"  Registration failed ({exc}).")
         print("  Wrapper cannot continue without a registered identity.")
@@ -1208,6 +1303,9 @@ def main():
     queue_file = _identity["queue"]
     if queue_file.exists():
         queue_file.write_text("", "utf-8")
+    action_file = data_dir / f"{assigned_name}_actions.jsonl"
+    if action_file.exists():
+        action_file.write_text("", "utf-8")
 
     strip_vars = {"CLAUDECODE"} | set(agent_cfg.get("strip_env", []))
     env = {k: v for k, v in os.environ.items() if k not in strip_vars}
@@ -1286,6 +1384,8 @@ def main():
 
     _watcher_inject_fn = None
     _watcher_thread = None
+    _action_handler_fn = None
+    _action_watcher_thread = None
     _is_multi_instance = registration.get("slot", 1) > 1
     _trigger_flag = [False]  # shared: queue watcher sets True, activity checker reads
     _refresh_interval = 10  # default; overridden per-trigger by server settings
@@ -1303,8 +1403,18 @@ def main():
         )
         _watcher_thread.start()
 
+    def start_action_watcher(handle_action_fn):
+        nonlocal _action_handler_fn, _action_watcher_thread
+        _action_handler_fn = handle_action_fn
+        _action_watcher_thread = threading.Thread(
+            target=_action_watcher,
+            args=(get_identity, data_dir, handle_action_fn),
+            daemon=True,
+        )
+        _action_watcher_thread.start()
+
     def _watcher_monitor():
-        nonlocal _watcher_thread
+        nonlocal _watcher_thread, _action_watcher_thread
         while True:
             time.sleep(5)
             if _watcher_thread and not _watcher_thread.is_alive() and _watcher_inject_fn:
@@ -1319,14 +1429,27 @@ def main():
                 _watcher_thread.start()
                 current_name, _ = get_identity()
                 _notify_recovery(data_dir, current_name)
+            if _action_watcher_thread and not _action_watcher_thread.is_alive() and _action_handler_fn:
+                _action_watcher_thread = threading.Thread(
+                    target=_action_watcher,
+                    args=(get_identity, data_dir, _action_handler_fn),
+                    daemon=True,
+                )
+                _action_watcher_thread.start()
+                current_name, _ = get_identity()
+                _notify_recovery(data_dir, current_name)
 
     threading.Thread(target=_watcher_monitor, daemon=True).start()
 
     _activity_checker = None
+    _last_active_at = [0.0]
 
     def _set_activity_checker(checker):
         nonlocal _activity_checker
         _activity_checker = checker
+
+    def _is_agent_busy():
+        return (time.time() - _last_active_at[0]) < 8.0
 
     def _activity_monitor():
         last_active = None
@@ -1339,6 +1462,8 @@ def main():
             try:
                 active = _activity_checker()
                 now = time.time()
+                if active:
+                    _last_active_at[0] = now
                 # Send on state change, periodically while active (refresh lease),
                 # or periodically while idle (keep presence alive)
                 IDLE_REPORT_INTERVAL = 8  # keep-alive while idle
@@ -1415,6 +1540,12 @@ def main():
         inject_env=inject_env,
         inject_delay=agent_cfg.get("inject_delay", 0.3),
         claude_session_state=claude_session_state,
+        start_action_watcher=start_action_watcher,
+        is_busy_fn=_is_agent_busy,
+        report_clear_event=lambda payload: _report_clear_event(server_port, get_token(), payload),
+        report_usage_event=lambda payload: _report_usage_event(server_port, get_token(), payload),
+        report_terminal_event=lambda kind, text: _report_terminal_event(server_port, get_token(), kind, text),
+        verify_claude_session_fn=lambda session_id: _find_claude_session_file(session_id) is not None,
     )
     # Windows-only injection tuning (no-op on other platforms).
     if sys.platform == "win32":

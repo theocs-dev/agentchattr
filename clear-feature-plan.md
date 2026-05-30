@@ -12,7 +12,7 @@
 | PR0 — Bugfix télémétrie recovery Claude | Fait | Livré séparément, sans sémantique clear. |
 | PR1 — Fondation clear | Fait | Couche de vérité livrée, sans injection terminale. |
 | PR2 — Workflow UI honnête | Fait | Confirmation UI par agent, sans action terminale. |
-| PR3 — Adaptateur Claude pilote (restart) | À faire | Inclut A1, reportée ici. |
+| PR3 — Adaptateur Claude pilote (restart) | En cours | Implémentation + tests mock ; activation par défaut bloquée jusqu'à preuve live Claude. |
 
 ---
 
@@ -161,10 +161,14 @@ Une nouvelle génération/révision de session **ne signifie jamais un clear** p
 
 ---
 
-### PR3 — Adaptateur Claude pilote (restart) — À faire
+### PR3 — Adaptateur Claude pilote (restart) — En cours
 **But :** tester **une seule** stratégie terminale avant toute généralisation. **Prérequis : PR0 mergé** (monitor générationnel en place).
 
 **Note A1 :** reportée à PR3 pour rester couplée à l'adaptateur Claude pilote et à la preuve live de `session_restart`.
+
+**Statut branche PR3 :** l'adaptateur `session_restart`, la file d'actions séparée, l'endpoint de demande explicite et les tests mock sont implémentés. `clear_supported=true` reste commenté dans `config.toml` tant que le test live Claude répétable n'a pas été capturé.
+
+**Politique `--no-restart` :** le clear explicite redémarre quand même (l'utilisateur a confirmé l'action). La recovery Claude automatique respecte `--no-restart` : elle ne tue pas la session, n'injecte pas le trigger dans un état connu comme cassé, et signale au chat que le trigger a été ignoré et doit être renvoyé après recovery manuelle.
 
 **Changements :**
 - File d'actions séparée `data/<name>_actions.jsonl` (Q1) — **une action clear ne passe jamais par `inject_fn(prompt)`.**

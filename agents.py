@@ -2,6 +2,8 @@
 
 import json
 import logging
+import time
+import uuid
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -83,3 +85,29 @@ class AgentTrigger:
             f.write(json.dumps(entry) + "\n")
 
         log.info("Queued @%s trigger (ch=%s, job=%s): %s", agent_name, channel, job_id, message[:80])
+
+    def queue_clear_context_sync(
+        self,
+        agent_name: str,
+        *,
+        channel: str = "general",
+        requested_by: str = "user",
+    ) -> dict:
+        """Queue a terminal action for the wrapper without using prompt injection."""
+        action_file = self._data_dir / f"{agent_name}_actions.jsonl"
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+
+        action = {
+            "type": "clear_context",
+            "strategy": "session_restart",
+            "request_id": uuid.uuid4().hex,
+            "requested_at": int(time.time()),
+            "requested_by": requested_by,
+            "channel": channel,
+            "confirmed_by_user": True,
+        }
+        with open(action_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(action) + "\n")
+
+        log.info("Queued clear_context action for @%s (ch=%s)", agent_name, channel)
+        return action

@@ -418,6 +418,12 @@ def run_agent(
     inject_delay: float = 0.3,
     enter_backend: str = "console_input",
     claude_session_state=None,
+    start_action_watcher=None,
+    is_busy_fn=None,
+    report_clear_event=None,
+    report_usage_event=None,
+    report_terminal_event=None,
+    verify_claude_session_fn=None,
 ):
     """Run agent as a direct subprocess, inject via Win32 console."""
     # Newer codex/claude/etc TUIs require VT processing on the parent console;

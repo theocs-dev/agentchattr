@@ -77,6 +77,176 @@ def _refresh_claude_session_id(args: list[str]) -> str:
     return next_id
 
 
+def _clear_event_payload(
+    state: str,
+    *,
+    reason: str,
+    action: dict | None = None,
+    generation=None,
+    session_ref=None,
+) -> dict:
+    payload = {
+        "state": state,
+        "strategy": "session_restart",
+        "confirmation": "wrapper_machine",
+        "reason": reason,
+    }
+    if action:
+        if action.get("requested_at") is not None:
+            payload["requested_at"] = action.get("requested_at")
+        if action.get("request_id") is not None:
+            payload["request_id"] = action.get("request_id")
+    if generation is not None:
+        payload["generation"] = generation
+    if session_ref is not None:
+        payload["session_ref"] = session_ref
+    return payload
+
+
+def _handle_claude_clear_context_action(
+    action: dict,
+    *,
+    agent: str,
+    session_name: str,
+    claude_session_state=None,
+    is_busy_fn=None,
+    session_exists_fn=_session_exists,
+    request_restart_fn=None,
+    report_clear_event=None,
+) -> bool:
+    """Validate a clear action and request a controlled Claude session restart."""
+    if action.get("type") != "clear_context":
+        return False
+
+    report_clear_event = report_clear_event or (lambda payload: None)
+    if agent != "claude" or action.get("strategy") != "session_restart":
+        report_clear_event(_clear_event_payload("failed", reason="unsupported_clear_action", action=action))
+        return True
+    if action.get("confirmed_by_user") is not True:
+        report_clear_event(_clear_event_payload("failed", reason="missing_user_confirmation", action=action))
+        return True
+    if is_busy_fn is not None and is_busy_fn():
+        report_clear_event(_clear_event_payload("failed", reason="adapter_refused_busy", action=action))
+        return True
+    if not session_exists_fn(session_name):
+        report_clear_event(_clear_event_payload("failed", reason="terminal_session_not_found", action=action))
+        return True
+    if request_restart_fn is None:
+        report_clear_event(_clear_event_payload("failed", reason="restart_handler_unavailable", action=action))
+        return True
+
+    session_ref = None
+    generation = None
+    if claude_session_state is not None:
+        session_ref, generation = claude_session_state.snapshot()
+    report_clear_event(_clear_event_payload(
+        "pending",
+        reason="session_restart_requested",
+        action=action,
+        generation=generation,
+        session_ref=session_ref,
+    ))
+    if not request_restart_fn({"type": "clear_context", "action": action}):
+        report_clear_event(_clear_event_payload("failed", reason="restart_already_pending", action=action))
+    return True
+
+
+def _finalize_claude_clear_restart(
+    action: dict,
+    *,
+    new_session_id: str,
+    generation: int | None,
+    verify_session_fn=None,
+    report_clear_event=None,
+    report_usage_event=None,
+    verify_timeout: float = 15.0,
+) -> bool:
+    """Report clear result after a controlled restart with a new session id."""
+    report_clear_event = report_clear_event or (lambda payload: None)
+    report_usage_event = report_usage_event or (lambda payload: None)
+
+    usage_payload = {
+        "provider": "claude",
+        "status": "unavailable",
+        "reason": "cleared; awaiting fresh telemetry",
+        "updated_at": int(time.time()),
+        "session_ref": new_session_id,
+    }
+    if generation is not None:
+        usage_payload["generation"] = generation
+    report_usage_event(usage_payload)
+
+    proof_observed = False
+    if verify_session_fn is not None:
+        deadline = time.time() + max(0.0, verify_timeout)
+        while True:
+            try:
+                proof_observed = bool(verify_session_fn(new_session_id))
+            except Exception:
+                proof_observed = False
+            if proof_observed or time.time() >= deadline:
+                break
+            time.sleep(0.25)
+
+    if proof_observed:
+        report_clear_event(_clear_event_payload(
+            "confirmed",
+            reason="new_session_file_observed",
+            action=action,
+            generation=generation,
+            session_ref=new_session_id,
+        ))
+        return True
+
+    report_clear_event(_clear_event_payload(
+        "failed",
+        reason="new_session_file_not_observed",
+        action=action,
+        generation=generation,
+        session_ref=new_session_id,
+    ))
+    return False
+
+
+def _request_claude_recovery_restart(
+    reason: str,
+    *,
+    session_name: str,
+    no_restart: bool,
+    set_restart_request_fn,
+    kill_session_fn,
+    session_exists_fn=_session_exists,
+    report_terminal_event=None,
+    sleep_fn=time.sleep,
+    now_fn=time.time,
+    timeout: float = 15.0,
+    print_fn=print,
+) -> bool:
+    if no_restart:
+        message = (
+            f"Claude recovery needed ({reason}) but --no-restart prevented automatic restart; "
+            f"trigger skipped. Reattach with: tmux attach -t {session_name}; "
+            "recover or restart Claude manually, then resend the message."
+        )
+        print_fn(f"  {message}")
+        if report_terminal_event is not None:
+            report_terminal_event("recovery_blocked", message)
+        return False
+
+    if not set_restart_request_fn({"type": "recovery", "reason": reason}):
+        return False
+    print_fn(f"  Claude recovery: {reason}; restarting with a fresh session id before injection.")
+    kill_session_fn(session_name)
+    deadline = now_fn() + timeout
+    while now_fn() < deadline:
+        if session_exists_fn(session_name):
+            sleep_fn(1.0)
+            return True
+        sleep_fn(0.25)
+    print_fn("  Claude recovery: timed out waiting for restarted tmux session; trigger skipped.")
+    return False
+
+
 def _check_tmux():
     """Verify tmux is installed, exit with helpful message if not."""
     if shutil.which("tmux"):
@@ -166,6 +336,12 @@ def run_agent(
     inject_env=None,
     inject_delay: float = 0.3,
     claude_session_state=None,
+    start_action_watcher=None,
+    is_busy_fn=None,
+    report_clear_event=None,
+    report_usage_event=None,
+    report_terminal_event=None,
+    verify_claude_session_fn=None,
 ):
     """Run agent inside a tmux session, inject via tmux send-keys."""
     _check_tmux()
@@ -177,23 +353,38 @@ def run_agent(
     abs_cwd = str(Path(cwd).resolve())
 
     # Wire up injection with the tmux session name
-    recovery_restart_requested = [False]
+    restart_request = [None]
+    restart_lock = __import__("threading").Lock()
+
+    def _set_restart_request(request: dict) -> bool:
+        with restart_lock:
+            if restart_request[0] is not None:
+                return False
+            restart_request[0] = request
+            return True
+
+    def _take_restart_request() -> dict | None:
+        with restart_lock:
+            request = restart_request[0]
+            restart_request[0] = None
+            return request
+
+    def _has_restart_request() -> bool:
+        with restart_lock:
+            return restart_request[0] is not None
 
     def _request_fresh_claude_session(reason: str) -> bool:
-        recovery_restart_requested[0] = True
-        print(f"  Claude recovery: {reason}; restarting with a fresh session id before injection.")
-        subprocess.run(
-            ["tmux", "kill-session", "-t", session_name],
-            capture_output=True,
+        return _request_claude_recovery_restart(
+            reason,
+            session_name=session_name,
+            no_restart=no_restart,
+            set_restart_request_fn=_set_restart_request,
+            kill_session_fn=lambda target: subprocess.run(
+                ["tmux", "kill-session", "-t", target],
+                capture_output=True,
+            ),
+            report_terminal_event=report_terminal_event,
         )
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            if _session_exists(session_name):
-                time.sleep(1.0)
-                return True
-            time.sleep(0.25)
-        print("  Claude recovery: timed out waiting for restarted tmux session; trigger skipped.")
-        return False
 
     def inject_fn(text):
         if agent == "claude":
@@ -207,6 +398,29 @@ def run_agent(
         inject(text, tmux_session=session_name, delay=inject_delay)
 
     start_watcher(inject_fn)
+    if agent == "claude" and start_action_watcher is not None:
+        def _handle_action(action: dict):
+            _handle_claude_clear_context_action(
+                action,
+                agent=agent,
+                session_name=session_name,
+                claude_session_state=claude_session_state,
+                is_busy_fn=is_busy_fn,
+                request_restart_fn=_request_clear_context_restart,
+                report_clear_event=report_clear_event,
+            )
+
+        def _request_clear_context_restart(request: dict) -> bool:
+            if not _set_restart_request(request):
+                return False
+            print("  Claude clear: restarting with a fresh session id.")
+            subprocess.run(
+                ["tmux", "kill-session", "-t", session_name],
+                capture_output=True,
+            )
+            return True
+
+        start_action_watcher(_handle_action)
 
     print(f"  Using tmux session: {session_name}")
     print(f"  Detach: Ctrl+B, D  (agent keeps running)")
@@ -220,12 +434,20 @@ def run_agent(
                 capture_output=True,
             )
 
-            if agent == "claude" and recovery_restart_requested[0]:
+            restart_for_this_launch = _take_restart_request() if agent == "claude" else None
+            clear_restart_action = None
+            clear_restart_generation = None
+            clear_restart_session_id = None
+            if agent == "claude" and restart_for_this_launch:
                 session_id = _refresh_claude_session_id(extra_args)
                 if claude_session_state is not None:
-                    claude_session_state.set_session_id(session_id)
-                recovery_restart_requested[0] = False
-                print(f"  Claude recovery: new --session-id {session_id}")
+                    clear_restart_generation = claude_session_state.set_session_id(session_id)
+                clear_restart_session_id = session_id
+                if restart_for_this_launch.get("type") == "clear_context":
+                    clear_restart_action = restart_for_this_launch.get("action") or {}
+                    print(f"  Claude clear: new --session-id {session_id}")
+                else:
+                    print(f"  Claude recovery: new --session-id {session_id}")
 
             agent_cmd = _build_agent_cmd(command, extra_args, strip_env, inject_env)
 
@@ -236,8 +458,27 @@ def run_agent(
                 env=env,
             )
             if result.returncode != 0:
+                if clear_restart_action is not None:
+                    report = report_clear_event or (lambda payload: None)
+                    report(_clear_event_payload(
+                        "failed",
+                        reason="restart_failed",
+                        action=clear_restart_action,
+                        generation=clear_restart_generation,
+                        session_ref=clear_restart_session_id,
+                    ))
                 print(f"  Error: failed to create tmux session (exit {result.returncode})")
                 break
+
+            if clear_restart_action is not None and clear_restart_session_id is not None:
+                _finalize_claude_clear_restart(
+                    clear_restart_action,
+                    new_session_id=clear_restart_session_id,
+                    generation=clear_restart_generation,
+                    verify_session_fn=verify_claude_session_fn,
+                    report_clear_event=report_clear_event,
+                    report_usage_event=report_usage_event,
+                )
 
             # Attach — blocks until agent exits or user detaches (Ctrl+B, D)
             subprocess.run(["tmux", "attach-session", "-t", session_name])
@@ -250,13 +491,19 @@ def run_agent(
                 print(f"  Reattach: tmux attach -t {session_name}")
                 while _session_exists(session_name):
                     time.sleep(1)
-                if agent == "claude" and recovery_restart_requested[0] and not no_restart:
+                if agent == "claude" and _has_restart_request():
                     print("\n  Claude recovery requested while detached; restarting in 3s...")
                     time.sleep(3)
                     continue
                 break
 
             # Session gone — agent exited
+            if agent == "claude" and _has_restart_request():
+                print(f"\n  {agent.capitalize()} restart requested.")
+                print("  Restarting in 3s... (Ctrl+C to quit)")
+                time.sleep(3)
+                continue
+
             if no_restart:
                 break
 
