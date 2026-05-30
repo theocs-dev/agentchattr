@@ -1300,6 +1300,33 @@ function getClearWorkflowSummary(rows = getClearWorkflowAgents()) {
     };
 }
 
+async function requestTerminalClear(agentName) {
+    const cfg = agentConfig[agentName];
+    if (!cfg?.clear_supported || cfg.busy) return;
+    const ok = window.confirm(
+        `Restart @${agentName}'s terminal session to clear its Claude context? ` +
+        'This kills the current TUI session and waits for wrapper proof.'
+    );
+    if (!ok) return;
+
+    try {
+        const resp = await fetch(`/api/clear_context/${encodeURIComponent(agentName)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Session-Token': SESSION_TOKEN },
+            body: JSON.stringify({ channel: activeChannel, requested_by: username }),
+        });
+        const payload = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            alert(payload.error || 'Terminal clear request failed.');
+            return;
+        }
+        cfg.clear_state = { state: 'pending', reason: 'request queued' };
+        _renderClearChatConfirm();
+    } catch (_) {
+        alert('Terminal clear request failed.');
+    }
+}
+
 function buildAgentProfileSettings() {
     const bases = ['claude', 'codex'];
     for (const base of bases) {
@@ -2135,6 +2162,9 @@ function _renderClearChatConfirm() {
                     <span class="clear-agent-detail">${escapeHtml(row.detail)}</span>
                 </span>
                 <span class="clear-agent-state">${escapeHtml(row.stateLabel)}</span>
+                ${row.actionState === 'requires_explicit_confirmation'
+                    ? `<button type="button" class="clear-agent-action" data-agent="${escapeHtml(row.name)}">Restart</button>`
+                    : ''}
             </div>
         `).join('')
         : '<div class="clear-empty">No registered agents.</div>';
@@ -2164,6 +2194,12 @@ function _renderClearChatConfirm() {
         _clearClearChatConfirm();
         document.getElementById('settings-bar').classList.add('hidden');
     };
+    confirmEl.querySelectorAll('.clear-agent-action[data-agent]').forEach(btn => {
+        btn.onclick = (e) => {
+            e.stopPropagation();
+            requestTerminalClear(btn.dataset.agent);
+        };
+    });
     confirmEl.querySelector('.clear-confirm-close').onclick = (e) => {
         e.stopPropagation();
         _clearClearChatConfirm();

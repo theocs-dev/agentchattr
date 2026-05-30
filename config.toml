@@ -13,6 +13,10 @@ cwd = "/Users/theocs/IPCRA"
 color = "#da7756"
 label = "Claude"
 fast_mode_default = true
+# PR3 Claude clear adapter. Leave disabled until a live Claude restart proof is
+# captured locally, then set clear_supported = true to expose the UI action.
+# clear_supported = true
+# clear_context_strategy = "session_restart"
 
 [agents.claude.profiles.max]
 label = "Opus 4.8 Max"

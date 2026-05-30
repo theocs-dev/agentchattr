@@ -2659,6 +2659,57 @@ async def clear_event(request: Request):
     return JSONResponse({"ok": True, "clear_state": result.get("clear_state", {})})
 
 
+@app.post("/api/clear_context/{agent_name}")
+async def request_clear_context(agent_name: str, request: Request):
+    """Queue an explicit terminal clear request for a supported wrapper."""
+    if not registry or not agents:
+        return JSONResponse({"error": "runtime registry unavailable"}, status_code=503)
+
+    inst = registry.get_instance(agent_name)
+    if not inst:
+        return JSONResponse({"error": "agent not found"}, status_code=404)
+    if inst.get("base") != "claude":
+        return JSONResponse({"error": "clear adapter is only implemented for Claude"}, status_code=409)
+    if not inst.get("clear_supported"):
+        return JSONResponse({"error": "terminal clear is not supported for this agent"}, status_code=409)
+    if inst.get("clear_strategy") != "session_restart":
+        return JSONResponse({"error": "unsupported clear strategy"}, status_code=409)
+    if inst.get("clear_confirmation") != "wrapper_machine":
+        return JSONResponse({"error": "unsupported clear confirmation"}, status_code=409)
+    if not inst.get("terminal_injectable"):
+        return JSONResponse({"error": "agent terminal is not actionable"}, status_code=409)
+    if inst.get("clear_state", {}).get("state") == "pending":
+        return JSONResponse({"error": "clear already pending"}, status_code=409)
+
+    import mcp_bridge
+    if not mcp_bridge.is_online(agent_name):
+        return JSONResponse({"error": "agent is offline"}, status_code=409)
+    if mcp_bridge.is_active(agent_name):
+        return JSONResponse({"error": "agent is busy"}, status_code=409)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    channel = str(body.get("channel") or _last_active_channel or "general").strip() or "general"
+    requested_by = str(body.get("requested_by") or room_settings.get("username", "user")).strip() or "user"
+
+    action = agents.queue_clear_context_sync(
+        agent_name,
+        channel=channel,
+        requested_by=requested_by,
+    )
+    return JSONResponse({
+        "ok": True,
+        "action": {
+            "type": action["type"],
+            "strategy": action["strategy"],
+            "request_id": action["request_id"],
+            "requested_at": action["requested_at"],
+        },
+    })
+
+
 @app.post("/api/deregister/{name}")
 async def deregister_agent(name: str, request: Request):
     """Wrapper calls this on shutdown to remove its instance."""

@@ -3505,7 +3505,7 @@ footer {
 
 .clear-agent-row {
     display: grid;
-    grid-template-columns: 8px minmax(0, 1fr) auto;
+    grid-template-columns: 8px minmax(0, 1fr) auto auto;
     align-items: center;
     gap: 8px;
     min-height: 36px;
@@ -3555,6 +3555,24 @@ footer {
     white-space: nowrap;
 }
 
+.clear-agent-action {
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    background: var(--white-06);
+    color: var(--text);
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1.2;
+    padding: 5px 8px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.clear-agent-action:hover {
+    border-color: var(--info);
+    color: var(--info);
+}
+
 .clear-agent-row--supported .clear-agent-dot { background: var(--info); }
 .clear-agent-row--supported .clear-agent-state { color: var(--info); background: rgba(96, 165, 250, 0.12); }
 .clear-agent-row--pending .clear-agent-dot { background: var(--warning); }
@@ -3587,7 +3605,8 @@ footer {
         grid-template-columns: 8px minmax(0, 1fr);
     }
 
-    .clear-agent-state {
+    .clear-agent-state,
+    .clear-agent-action {
         grid-column: 2;
         justify-self: start;
     }
