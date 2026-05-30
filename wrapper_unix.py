@@ -199,8 +199,8 @@ def _finalize_claude_clear_restart(
         return True
 
     report_clear_event(_clear_event_payload(
-        "failed",
-        reason="new_session_file_not_observed",
+        "pending",
+        reason="awaiting_session_file",
         action=action,
         generation=generation,
         session_ref=new_session_id,

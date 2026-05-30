@@ -12,7 +12,7 @@
 | PR0 — Bugfix télémétrie recovery Claude | Fait | Livré séparément, sans sémantique clear. |
 | PR1 — Fondation clear | Fait | Couche de vérité livrée, sans injection terminale. |
 | PR2 — Workflow UI honnête | Fait | Confirmation UI par agent, sans action terminale. |
-| PR3 — Adaptateur Claude pilote (restart) | En cours | Implémentation + tests mock ; activation par défaut bloquée jusqu'à preuve live Claude. |
+| PR3 — Adaptateur Claude pilote (restart) | Bloqué F1 live | Implémentation + tests mock mergés ; F3 corrige la preuve absente en `pending`; activation par défaut bloquée après échec du test idle Claude. |
 
 ---
 
@@ -161,12 +161,14 @@ Une nouvelle génération/révision de session **ne signifie jamais un clear** p
 
 ---
 
-### PR3 — Adaptateur Claude pilote (restart) — En cours
+### PR3 — Adaptateur Claude pilote (restart) — Bloqué F1 live
 **But :** tester **une seule** stratégie terminale avant toute généralisation. **Prérequis : PR0 mergé** (monitor générationnel en place).
 
 **Note A1 :** reportée à PR3 pour rester couplée à l'adaptateur Claude pilote et à la preuve live de `session_restart`.
 
-**Statut branche PR3 :** l'adaptateur `session_restart`, la file d'actions séparée, l'endpoint de demande explicite et les tests mock sont implémentés. `clear_supported=true` reste commenté dans `config.toml` tant que le test live Claude répétable n'a pas été capturé.
+**Statut branche PR3 :** l'adaptateur `session_restart`, la file d'actions séparée, l'endpoint de demande explicite et les tests mock sont implémentés et mergés via PR #11. `clear_supported=true` reste commenté dans `config.toml` tant que le test live Claude répétable n'a pas été capturé.
+
+**Preuve F1 live — 2026-05-30 16:57:06 CEST :** test effectué avec `claude --session-id 81e38f2e-8fcf-4b86-85bd-4ef71e100901` lancé idle dans la session tmux temporaire `agentchattr-f1-81e38f`, cwd `/Users/theocs/IPCRA`. Aucun prompt, no-op ou injection n'a été envoyé. Après environ 45 secondes, `find /Users/theocs/.claude/projects -name '81e38f2e-8fcf-4b86-85bd-4ef71e100901.jsonl' -print` n'a retourné aucun chemin. Le pane tmux montrait Claude Code v2.1.158 idle au prompt. Session temporaire nettoyée par `tmux kill-session -t agentchattr-f1-81e38f`. Résultat : F1 échoue pour le démarrage idle, donc `clear_supported=true` ne doit pas être activé.
 
 **Politique `--no-restart` :** le clear explicite redémarre quand même (l'utilisateur a confirmé l'action). La recovery Claude automatique respecte `--no-restart` : elle ne tue pas la session, n'injecte pas le trigger dans un état connu comme cassé, et signale au chat que le trigger a été ignoré et doit être renvoyé après recovery manuelle.
 
