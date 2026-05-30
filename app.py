@@ -950,6 +950,11 @@ async def _handle_new_message(msg: dict):
     if sender == "system":
         return
 
+    # Presence messages are UI state only. Do not let deregistered or unknown
+    # senders fall through to default human-message routing.
+    if msg_type in ("join", "leave"):
+        return
+
     # Check for slash commands — use stripped text (sans @mentions)
     if stripped == "/continue":
         if sender in known_agents:

@@ -459,6 +459,39 @@ class MessageDefaultRoutingTests(unittest.TestCase):
             ["claude", "codex"],
         )
 
+    def test_leave_from_unknown_sender_does_not_route_to_default_targets(self):
+        asyncio.run(app._handle_new_message({
+            "sender": "codex-2",
+            "text": "codex-2 disconnected (timeout)",
+            "type": "leave",
+            "channel": "general",
+        }))
+
+        self.assertEqual(app.agents.triggered, [])
+
+    def test_non_agent_join_does_not_route_to_default_targets(self):
+        asyncio.run(app._handle_new_message({
+            "sender": "observer",
+            "text": "observer is online",
+            "type": "join",
+            "channel": "general",
+        }))
+
+        self.assertEqual(app.agents.triggered, [])
+
+    def test_session_request_still_routes_to_target_agent(self):
+        asyncio.run(app._handle_new_message({
+            "sender": "Theo",
+            "text": "@codex Design a session workflow for: **triage failures**",
+            "type": "session_request",
+            "channel": "general",
+        }))
+
+        self.assertEqual(
+            [trigger["agent"] for trigger in app.agents.triggered],
+            ["codex"],
+        )
+
     def test_stale_websocket_does_not_block_default_routing(self):
         app.ws_clients.add(HangingClient())
 
