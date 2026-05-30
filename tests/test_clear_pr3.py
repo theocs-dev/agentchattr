@@ -309,7 +309,7 @@ class ClearPr3Tests(unittest.TestCase):
         self.assertEqual(events[-1]["state"], "confirmed")
         self.assertEqual(events[-1]["reason"], "new_session_file_observed")
 
-    def test_clear_restart_fails_without_session_file_proof(self):
+    def test_clear_restart_stays_pending_without_session_file_proof(self):
         events = []
 
         confirmed = wrapper_unix._finalize_claude_clear_restart(
@@ -322,8 +322,9 @@ class ClearPr3Tests(unittest.TestCase):
         )
 
         self.assertFalse(confirmed)
-        self.assertEqual(events[-1]["state"], "failed")
-        self.assertEqual(events[-1]["reason"], "new_session_file_not_observed")
+        self.assertEqual(events[-1]["state"], "pending")
+        self.assertEqual(events[-1]["reason"], "awaiting_session_file")
+        self.assertFalse(any(event["state"] == "failed" for event in events))
 
 
 if __name__ == "__main__":
