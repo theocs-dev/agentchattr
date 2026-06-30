@@ -132,15 +132,16 @@ class ArchiveRoundTripTests(unittest.TestCase):
             {"messages": 2, "jobs": 1, "rules": 2, "summaries": 2},
         )
 
-        channel_list = ["general"]
+        settings = {"channels": ["general"], "archived_channels": []}
+        config = {"server": {"max_channels": 8, "max_archived_channels": 50}}
         report = archive.import_archive(
             blob,
             self.target_store,
             self.target_jobs,
             self.target_rules,
             self.target_summaries,
-            channel_list,
-            max_channels=8,
+            settings,
+            config,
         )
 
         self.assertTrue(report["ok"])
@@ -148,8 +149,11 @@ class ArchiveRoundTripTests(unittest.TestCase):
         self.assertEqual(report["sections"]["jobs"]["created"], 1)
         self.assertEqual(report["sections"]["rules"]["created"], 2)
         self.assertEqual(report["sections"]["summaries"]["created"], 2)
-        self.assertIn("planning", channel_list)
+        self.assertIn("planning", settings["channels"])
         self.assertIn("planning", report["channels"]["created"])
+        # Never remap to general; the new report has no "remapped" bucket.
+        self.assertNotIn("remapped", report["channels"])
+        self.assertEqual(report["channels"]["unregistered"], [])
 
         imported_messages = self.target_store.get_recent(10)
         self.assertEqual(imported_messages[0]["uid"], "msg-root")
@@ -183,8 +187,8 @@ class ArchiveRoundTripTests(unittest.TestCase):
             self.target_jobs,
             self.target_rules,
             self.target_summaries,
-            channel_list,
-            max_channels=8,
+            settings,
+            config,
         )
         self.assertTrue(second_report["ok"])
         self.assertEqual(second_report["sections"]["messages"]["duplicates"], 2)
@@ -212,8 +216,8 @@ class ArchiveRoundTripTests(unittest.TestCase):
             self.target_jobs,
             self.target_rules,
             self.target_summaries,
-            ["general"],
-            max_channels=8,
+            {"channels": ["general"], "archived_channels": []},
+            {"server": {"max_channels": 8}},
         )
 
         self.assertFalse(report["ok"])

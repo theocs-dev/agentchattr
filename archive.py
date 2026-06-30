@@ -3,11 +3,12 @@
 import hashlib
 import io
 import json
-import re
 import threading
 import time
 import uuid
 import zipfile
+
+import channel_registry as chreg
 
 SCHEMA_VERSION = 1
 MAX_IMPORT_SIZE = 50 * 1024 * 1024  # 50MB uncompressed
@@ -133,11 +134,12 @@ def build_export(store, jobs_store, rules_store, summary_store,
 # ---------------------------------------------------------------------------
 
 def import_archive(zip_bytes: bytes, store, jobs_store, rules_store,
-                   summary_store, channel_list: list[str],
-                   max_channels: int = 8) -> dict:
+                   summary_store, settings: dict, config: dict | None = None) -> dict:
     """Import a zip archive, merging into current stores.
 
-    Returns a report dict with counts and warnings.
+    `settings` is the room settings dict (mutated in place via the channel
+    registry: imported channels are added to `channels`/`archived_channels`).
+    `config` supplies the active/archived caps. Returns a report dict.
     """
     # Issue #5: import lock prevents concurrent imports
     if not _import_lock.acquire(blocking=False):
@@ -145,13 +147,13 @@ def import_archive(zip_bytes: bytes, store, jobs_store, rules_store,
 
     try:
         return _do_import(zip_bytes, store, jobs_store, rules_store,
-                          summary_store, channel_list, max_channels)
+                          summary_store, settings, config or {})
     finally:
         _import_lock.release()
 
 
 def _do_import(zip_bytes, store, jobs_store, rules_store,
-               summary_store, channel_list, max_channels):
+               summary_store, settings, config):
     warnings = []
 
     # Validate zip
@@ -188,7 +190,12 @@ def _do_import(zip_bytes, store, jobs_store, rules_store,
         "mode": "merge",
         "archive": archive_info,
         "sections": {},
-        "channels": {"created": [], "remapped": [], "skipped": []},
+        # created  -> added as an active channel
+        # archived -> added straight to the archived list (active cap reached)
+        # unregistered -> kept under its original name in the store, in neither
+        #   list (over caps or invalid name); recoverable later via restore.
+        #   We NEVER remap to `general` — that would destroy channel semantics.
+        "channels": {"created": [], "archived": [], "unregistered": []},
         "warnings": warnings,
     }
 
@@ -207,21 +214,17 @@ def _do_import(zip_bytes, store, jobs_store, rules_store,
         for r in rules_store.list_all():
             existing_rule_uids.add(_ensure_uid(r))
 
-    # Helper: resolve channel
+    # Helper: resolve channel through the registry (single source of truth for
+    # the name rule + caps). Never remaps to `general`.
+    _seen_categories: dict[str, str] = {}
+
     def resolve_channel(ch: str) -> str:
-        if not ch:
-            return "general"
-        if ch in channel_list:
-            return ch
-        # Try to auto-create
-        if len(channel_list) < max_channels:
-            if re.match(r'^[a-z0-9][a-z0-9-]{0,29}$', ch):
-                channel_list.append(ch)
-                report["channels"]["created"].append(ch)
-                return ch
-        # Remap to general
-        report["channels"]["remapped"].append({"from": ch, "to": "general", "reason": "invalid_or_full"})
-        return "general"
+        resolved, category = chreg.import_resolve(settings, ch, config)
+        # Report each distinct channel once, in the bucket matching its fate.
+        if category in ("created", "archived", "unregistered") and _seen_categories.get(resolved) != category:
+            _seen_categories[resolved] = category
+            report["channels"][category].append(resolved)
+        return resolved
 
     # --- Import messages (preserve archive uid, timestamp, time, reply links) ---
     msg_report = {"created": 0, "duplicates": 0, "conflicts": 0, "skipped": 0}
@@ -409,10 +412,12 @@ def _do_import(zip_bytes, store, jobs_store, rules_store,
             if not raw_channel:
                 summary_report["skipped"] += 1
                 continue
-            # Resolve through channel resolver (creates if valid and capacity allows)
+            # Resolve through the registry (created/archived/unregistered — never
+            # remapped to general). The summary attaches to the resolved name.
             channel = resolve_channel(raw_channel)
-            # Skip summaries for remapped channels (don't overwrite general with wrong summary)
-            if channel != raw_channel and raw_channel not in channel_list:
+            if channel != chreg.normalize(raw_channel):
+                # Should not happen (resolve only normalizes), but guard against
+                # ever silently overwriting another channel's summary.
                 summary_report["skipped"] += 1
                 warnings.append(f"summary for '{raw_channel}' skipped (channel unavailable)")
                 continue
