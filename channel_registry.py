@@ -56,11 +56,16 @@ def max_archived(config: dict) -> int:
 # --- helpers --------------------------------------------------------------
 
 def normalize(name) -> str:
-    return (name or "").strip().lower()
+    # Coerce defensively: a corrupt settings.json may hold non-strings
+    # (ints, dicts) in the channel lists. Those become "" and are dropped,
+    # never crash the boot.
+    if not isinstance(name, str):
+        return ""
+    return name.strip().lower()
 
 
-def is_valid(name: str) -> bool:
-    return bool(NAME_RE.match(name or ""))
+def is_valid(name) -> bool:
+    return isinstance(name, str) and bool(NAME_RE.match(name))
 
 
 def _active(settings: dict) -> list:
@@ -212,15 +217,22 @@ def import_resolve(settings: dict, name: str, config: dict) -> tuple[str, str]:
 def normalize_on_load(settings: dict) -> bool:
     """Enforce all invariants on persisted settings. Returns True iff anything
     was corrected (so the caller can save only when needed, avoiding churn).
-    Caps use the registry defaults here; `max_active`/`max_archived` with the
-    live config are applied by the caller right after, but we also cap with the
-    defaults as a floor of sanity. Overflow is moved (active->archived) or
-    dropped (archived->unregistered), NEVER purged.
+    Robust to corrupt input: non-list lists and non-string / invalid entries
+    are coerced away instead of crashing the boot. Overflow handling lives in
+    `apply_caps`; this only normalizes shape + invariants.
     """
-    before = (list(_active(settings)), list(_archived(settings)))
+    # Snapshot the RAW values first, WITHOUT going through _active/_archived
+    # (those would mutate settings and make the change undetectable).
+    raw_active = settings.get("channels")
+    raw_archived = settings.get("archived_channels")
+    before = (raw_active, raw_archived)
 
-    active = [c for c in _active(settings) if is_valid(c)]
-    archived = [c for c in _archived(settings) if is_valid(c)]
+    src_active = raw_active if isinstance(raw_active, list) else []
+    src_archived = raw_archived if isinstance(raw_archived, list) else []
+
+    # Coerce -> normalize -> keep only valid names.
+    active = [c for c in (normalize(c) for c in src_active) if is_valid(c)]
+    archived = [c for c in (normalize(c) for c in src_archived) if is_valid(c)]
 
     # Dedupe, preserving order.
     active = list(dict.fromkeys(active))
@@ -238,7 +250,7 @@ def normalize_on_load(settings: dict) -> bool:
     settings["channels"] = active
     settings["archived_channels"] = archived
 
-    after = (list(_active(settings)), list(_archived(settings)))
+    after = (active, archived)
     return before != after
 
 

@@ -188,11 +188,47 @@ class NormalizeOnLoad(unittest.TestCase):
         chreg.normalize_on_load(s)
         self.assertNotIn("general", s["archived_channels"])
 
-    def test_invalid_names_dropped(self):
+    def test_invalid_names_dropped_valid_normalized(self):
+        # "Bad Name" (space) is unsalvageable -> dropped. "AlsoBad" just needs
+        # lowercasing -> kept as "alsobad".
         s = _settings(["general", "Bad Name", "ok"], ["AlsoBad"])
         chreg.normalize_on_load(s)
         self.assertEqual(s["channels"], ["general", "ok"])
+        self.assertEqual(s["archived_channels"], ["alsobad"])
+
+    def test_robust_to_non_list_channels(self):
+        # Corrupt settings.json must not crash the boot; it gets coerced and
+        # the correction must be reported as changed (so the caller persists it).
+        s = {"channels": "oops", "archived_channels": None}
+        self.assertTrue(chreg.normalize_on_load(s))
+        self.assertEqual(s["channels"], ["general"])
         self.assertEqual(s["archived_channels"], [])
+
+    def test_robust_to_non_string_entries(self):
+        s = {"channels": ["general", 123, {"x": 1}, "ok"], "archived_channels": [None, "arch"]}
+        self.assertTrue(chreg.normalize_on_load(s))  # no TypeError
+        self.assertEqual(s["channels"], ["general", "ok"])
+        self.assertEqual(s["archived_channels"], ["arch"])
+
+    def test_normalizes_case_instead_of_dropping(self):
+        # "General"/"Plan" should be lowercased, not discarded.
+        s = {"channels": ["General", "Plan"], "archived_channels": []}
+        chreg.normalize_on_load(s)
+        self.assertEqual(s["channels"], ["general", "plan"])
+
+    def test_correction_is_idempotent(self):
+        s = {"channels": "oops", "archived_channels": None}
+        self.assertTrue(chreg.normalize_on_load(s))
+        self.assertFalse(chreg.normalize_on_load(s))  # second pass: nothing to fix
+
+
+class Normalize(unittest.TestCase):
+    def test_coerces_non_strings_without_crashing(self):
+        self.assertEqual(chreg.normalize(123), "")
+        self.assertEqual(chreg.normalize(None), "")
+        self.assertEqual(chreg.normalize({"x": 1}), "")
+        self.assertEqual(chreg.normalize("  Plan "), "plan")
+        self.assertFalse(chreg.is_valid(123))
 
 
 class ApplyCaps(unittest.TestCase):

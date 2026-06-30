@@ -577,6 +577,10 @@ function connectWebSocket() {
                 localStorage.setItem('agentchattr-channel', event.new_name);
                 Store.set('activeChannel', event.new_name);
             }
+            // Re-filter + re-render so migrated messages show under the new name
+            // regardless of broadcast ordering (channel_renamed vs settings).
+            if (window.filterMessagesByChannel) filterMessagesByChannel();
+            if (window.renderChannelTabs) renderChannelTabs();
         } else if (event.type === 'edit') {
             // A message was edited/demoted — re-render it in place
             const updatedMsg = event.message;

@@ -217,12 +217,11 @@ function _showSidebarRenameDialog(oldName) {
         const newName = input.value.trim().toLowerCase();
         if (!newName || !/^[a-z0-9][a-z0-9\-]{0,19}$/.test(newName)) return;
         if (newName !== oldName) {
-            window.ws.send(JSON.stringify({ type: 'channel_rename', old_name: oldName, new_name: newName }));
-            if (window.activeChannel === oldName) {
-                window._setActiveChannel(newName);
-                localStorage.setItem('agentchattr-channel', newName);
-                Store.set('activeChannel', newName);
-            }
+            // Don't move locally before the server confirms — on a rejected
+            // rename (collision, missing channel) we'd be stranded on a name
+            // that doesn't exist. The channel_renamed broadcast migrates the
+            // active channel on success; a negative channel_result toasts.
+            window.ws.send(JSON.stringify({ type: 'channel_rename', old_name: oldName, new_name: newName, request_id: _channelReqId() }));
         }
         cleanup();
     };
@@ -260,8 +259,10 @@ function _showSidebarRenameDialog(oldName) {
 // via restore. No confirm needed because nothing is lost.
 function archiveChannel(name) {
     if (name === 'general') return;
+    // Don't switch optimistically: if the server confirms, the settings
+    // broadcast drops the channel from the active list and applySettings()
+    // moves us off it. If it's refused, we correctly stay put.
     window.ws.send(JSON.stringify({ type: 'channel_archive', name, request_id: _channelReqId() }));
-    if (window.activeChannel === name) switchChannel('general');
 }
 
 // Restore a previously archived channel back into the active bar.
@@ -369,6 +370,9 @@ function switchChannel(name) {
     filterMessagesByChannel();
     renderChannelTabs();
     Store.set('activeChannel', name);
+    // Lazily pull history for a channel whose messages aren't in the DOM yet
+    // (e.g. one just restored from the archive, or never loaded at connect).
+    hydrateChannelIfEmpty(name);
     // Restore: scroll to saved message, or bottom if none saved
     const savedId = _channelScrollMsg[name];
     if (savedId) {
@@ -376,6 +380,34 @@ function switchChannel(name) {
         if (el) { el.scrollIntoView({ block: 'start' }); return; }
     }
     window.scrollToBottom();
+}
+
+// Fetch + inject a channel's stored history on demand. Idempotent: messages
+// already in the DOM (by id) are skipped, so re-switching never duplicates.
+// This is what makes archived -> restore actually show the conversation again,
+// since the connect-time hydration only covers active channels.
+async function hydrateChannelIfEmpty(name) {
+    const container = document.getElementById('messages');
+    if (!container) return;
+    const hasAny = Array.from(container.children).some(
+        el => el.dataset.id && (el.dataset.channel || 'general') === name);
+    if (hasAny) return;
+    try {
+        const resp = await fetch(
+            `/api/messages?channel=${encodeURIComponent(name)}&limit=500`,
+            { headers: { 'X-Session-Token': window.SESSION_TOKEN } });
+        if (!resp.ok) return;
+        const msgs = await resp.json();
+        if (!Array.isArray(msgs) || !msgs.length) return;
+        for (const m of msgs) {
+            if (container.querySelector(`.message[data-id="${m.id}"]`)) continue;
+            window.appendMessage(m);
+        }
+        filterMessagesByChannel();
+        if (name === window.activeChannel) window.scrollToBottom();
+    } catch (e) {
+        /* best-effort hydration; the channel still works, just without backfill */
+    }
 }
 
 function filterMessagesByChannel() {
@@ -499,12 +531,11 @@ function showChannelRenameDialog(oldName) {
         const newName = input.value.trim().toLowerCase();
         if (!newName || !/^[a-z0-9][a-z0-9\-]{0,19}$/.test(newName)) return;
         if (newName !== oldName) {
-            window.ws.send(JSON.stringify({ type: 'channel_rename', old_name: oldName, new_name: newName }));
-            if (window.activeChannel === oldName) {
-                window._setActiveChannel(newName);
-                localStorage.setItem('agentchattr-channel', newName);
-                Store.set('activeChannel', newName);
-            }
+            // Don't move locally before the server confirms — on a rejected
+            // rename (collision, missing channel) we'd be stranded on a name
+            // that doesn't exist. The channel_renamed broadcast migrates the
+            // active channel on success; a negative channel_result toasts.
+            window.ws.send(JSON.stringify({ type: 'channel_rename', old_name: oldName, new_name: newName, request_id: _channelReqId() }));
         }
         cleanup();
     };
