@@ -71,9 +71,11 @@ room_settings: dict = {
     "agent_fast_modes": {},
 }
 
-# Channel validation
-_CHANNEL_NAME_RE = _re.compile(r'^[a-z0-9][a-z0-9\-]{0,19}$')
-MAX_CHANNELS = 8
+# Channel registry: single source of truth for channel-name validation, the
+# active cap, and the active/archived lists. The WS handlers, the settings
+# loader, and archive.py all route through it so there is exactly one rule set
+# (no more divergent regexes or a hardcoded cap copied across files).
+import channel_registry as chreg
 
 # Agent hats (persisted to data/hats.json)
 agent_hats: dict[str, str] = {}  # { agent_name: svg_string }
@@ -174,11 +176,15 @@ def _load_settings():
             room_settings.update(saved)
         except Exception:
             pass
-    # Ensure "general" always exists and is first
-    if "channels" not in room_settings or not room_settings["channels"]:
-        room_settings["channels"] = ["general"]
-    elif "general" not in room_settings["channels"]:
-        room_settings["channels"].insert(0, "general")
+    # Channel lists: enforce every invariant through the registry (general
+    # active+first, active ∩ archived = ∅, dedup, valid names) then apply the
+    # configured caps. Persist only if normalization actually corrected
+    # something, to avoid rewriting settings.json on every boot.
+    channels_changed = chreg.normalize_on_load(room_settings)
+    channels_changed = chreg.apply_caps(room_settings, config) or channels_changed
+    # Expose the active cap to clients via the settings broadcast (front reads
+    # this instead of hardcoding a number).
+    room_settings["max_channels"] = chreg.max_active(config)
     if not isinstance(room_settings.get("agent_profiles"), dict):
         room_settings["agent_profiles"] = {}
     if not isinstance(room_settings.get("agent_fast_modes"), dict):
@@ -192,6 +198,8 @@ def _load_settings():
                 room_settings["agent_profiles"][base] = _default_profile_name(base)
         if _fast_mode_supported(base) and base not in room_settings["agent_fast_modes"]:
             room_settings["agent_fast_modes"][base] = _default_fast_mode_enabled(base)
+    if channels_changed:
+        _save_settings()
 
 
 def _save_settings():
@@ -1368,6 +1376,25 @@ async def broadcast_settings():
     await _broadcast_text(data)
 
 
+def _channels_snapshot(s: dict) -> tuple:
+    """Cheap signature of the active+archived lists, to decide whether a channel
+    mutation actually changed anything (and thus warrants save+broadcast)."""
+    return (list(s.get("channels") or []), list(s.get("archived_channels") or []))
+
+
+async def _send_channel_result(ws, event: dict, action: str, result: dict):
+    """ACK a channel mutation to the REQUESTER ONLY. `settings` stays the
+    canonical source of truth for every other client; this is just feedback so
+    the caller can distinguish created/exists/invalid/full/archived/… instead of
+    inferring failure from a settings broadcast that never arrives."""
+    await ws.send_text(json.dumps({
+        "type": "channel_result",
+        "request_id": event.get("request_id"),
+        "action": action,
+        **result,
+    }))
+
+
 async def broadcast_rule(action: str, rule: dict):
     data = json.dumps({"type": "rule", "action": action, "data": rule})
     await _broadcast_text(data)
@@ -1812,55 +1839,77 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             elif event.get("type") == "channel_create":
-                name = (event.get("name") or "").strip().lower()
-                if not name or not _CHANNEL_NAME_RE.match(name):
-                    continue
-                if name in room_settings["channels"]:
-                    continue
-                if len(room_settings["channels"]) >= MAX_CHANNELS:
-                    continue
-                room_settings["channels"].append(name)
-                _save_settings()
-                await broadcast_settings()
+                before = _channels_snapshot(room_settings)
+                result = chreg.create(room_settings, event.get("name"), config)
+                if _channels_snapshot(room_settings) != before:
+                    _save_settings()
+                    await broadcast_settings()
+                await _send_channel_result(websocket, event, "create", result)
+
+            elif event.get("type") == "channel_archive":
+                # Soft close: hide the channel but KEEP its messages in the store
+                # (recoverable via restore). Cursors are intentionally preserved.
+                before = _channels_snapshot(room_settings)
+                result = chreg.archive(room_settings, event.get("name"))
+                if _channels_snapshot(room_settings) != before:
+                    _save_settings()
+                    await broadcast_settings()
+                await _send_channel_result(websocket, event, "archive", result)
+
+            elif event.get("type") == "channel_restore":
+                name = chreg.normalize(event.get("name"))
+                # Guard against phantom restores: a name that is neither archived
+                # nor backed by stored messages has no history to bring back.
+                if (not chreg.is_active(room_settings, name)
+                        and not chreg.is_archived(room_settings, name)
+                        and not store.has_channel(name)):
+                    result = {"ok": False, "reason": "not_found", "name": name}
+                else:
+                    before = _channels_snapshot(room_settings)
+                    result = chreg.restore(room_settings, name, config)
+                    if _channels_snapshot(room_settings) != before:
+                        _save_settings()
+                        await broadcast_settings()
+                await _send_channel_result(websocket, event, "restore", result)
 
             elif event.get("type") == "channel_rename":
-                old_name = (event.get("old_name") or "").strip().lower()
-                new_name = (event.get("new_name") or "").strip().lower()
-                if old_name == "general":
-                    continue
-                if not new_name or not _CHANNEL_NAME_RE.match(new_name):
-                    continue
-                if old_name not in room_settings["channels"]:
-                    continue
-                if new_name in room_settings["channels"]:
-                    continue
-                idx = room_settings["channels"].index(old_name)
-                room_settings["channels"][idx] = new_name
-                store.rename_channel(old_name, new_name)
-                import mcp_bridge
-                mcp_bridge.migrate_cursors_rename(old_name, new_name)
-                _save_settings()
-                await broadcast_settings()
-                # Tell clients to migrate DOM elements
-                rename_event = json.dumps({
-                    "type": "channel_renamed",
-                    "old_name": old_name,
-                    "new_name": new_name,
-                })
-                await _broadcast_text(rename_event)
+                result = chreg.rename(room_settings, event.get("old_name"), event.get("new_name"))
+                if result["ok"]:
+                    old_name = chreg.normalize(event.get("old_name"))
+                    new_name = result["name"]
+                    store.rename_channel(old_name, new_name)
+                    import mcp_bridge
+                    mcp_bridge.migrate_cursors_rename(old_name, new_name)
+                    _save_settings()
+                    await broadcast_settings()
+                    # Tell clients to migrate DOM elements
+                    await _broadcast_text(json.dumps({
+                        "type": "channel_renamed",
+                        "old_name": old_name,
+                        "new_name": new_name,
+                    }))
+                await _send_channel_result(websocket, event, "rename", result)
 
-            elif event.get("type") == "channel_delete":
-                name = (event.get("name") or "").strip().lower()
-                if name == "general":
-                    continue
-                if name not in room_settings["channels"]:
-                    continue
-                room_settings["channels"].remove(name)
-                store.delete_channel(name)
-                import mcp_bridge
-                mcp_bridge.migrate_cursors_delete(name)
-                _save_settings()
-                await broadcast_settings()
+            elif event.get("type") in ("channel_purge", "channel_delete"):
+                # DESTRUCTIVE: drops the channel AND deletes its messages. The UI
+                # exposes this only behind an explicit "Delete permanently"
+                # confirm; the default delete affordance now archives instead.
+                # `channel_delete` is kept as a back-compat alias for old clients.
+                name = chreg.normalize(event.get("name"))
+                known = (chreg.is_active(room_settings, name)
+                         or chreg.is_archived(room_settings, name)
+                         or store.has_channel(name))
+                if not known:
+                    result = {"ok": False, "reason": "not_found", "name": name}
+                else:
+                    result = chreg.purge(room_settings, name)
+                    if result["ok"]:
+                        store.delete_channel(name)
+                        import mcp_bridge
+                        mcp_bridge.migrate_cursors_delete(name)
+                        _save_settings()
+                        await broadcast_settings()
+                await _send_channel_result(websocket, event, "purge", result)
 
     except WebSocketDisconnect:
         ws_clients.discard(websocket)
@@ -1933,19 +1982,17 @@ async def import_history(file: UploadFile = File(...)):
             {"error": f"file too large (max {_archive.MAX_IMPORT_SIZE // 1024 // 1024}MB)"},
             status_code=400,
         )
-    channel_list = list(room_settings.get("channels", ["general"]))
-    max_ch = room_settings.get("max_channels", 8)
+    # The registry mutates room_settings' channel lists in place during import.
     report = _archive.import_archive(
         content, store, jobs, rules, summaries,
-        channel_list, max_channels=max_ch,
+        room_settings, config,
     )
     if not report.get("ok"):
         error = report.get("error", "import failed")
         status = 409 if "already running" in error else 400
         return JSONResponse({"error": error}, status_code=status)
-    # Update channel list if new channels were created
-    if report["channels"]["created"]:
-        room_settings["channels"] = channel_list
+    # Persist + broadcast if the import added any active or archived channels.
+    if report["channels"]["created"] or report["channels"]["archived"]:
         _save_settings()
         await broadcast_settings()
     # Tell all connected clients to reload (picks up imported messages)

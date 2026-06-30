@@ -9,6 +9,17 @@
 
 const _channelScrollMsg = {};  // channel name -> message ID at top of viewport
 
+// Active-channel cap, read from the server settings broadcast (single source of
+// truth). Falls back to 8 only before the first settings message arrives.
+function _maxActive() {
+    return (typeof window.maxChannels === 'number' && window.maxChannels >= 1)
+        ? window.maxChannels : 8;
+}
+
+function _channelReqId() {
+    return 'req-' + Math.random().toString(36).slice(2, 8);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -68,12 +79,12 @@ function renderChannelTabs() {
             editBtn.onclick = (e) => { e.stopPropagation(); showChannelRenameDialog(name); };
             actions.appendChild(editBtn);
 
-            const delBtn = document.createElement('button');
-            delBtn.className = 'ch-delete-btn';
-            delBtn.title = 'Delete';
-            delBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6 4V3h4v1M5 4v8.5h6V4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-            delBtn.onclick = (e) => { e.stopPropagation(); deleteChannel(name); };
-            actions.appendChild(delBtn);
+            const archBtn = document.createElement('button');
+            archBtn.className = 'ch-delete-btn';
+            archBtn.title = 'Archive (hide, keep history)';
+            archBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M2 4h12v3H2zM3 7v6h10V7M6.5 9.5h3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+            archBtn.onclick = (e) => { e.stopPropagation(); archiveChannel(name); };
+            actions.appendChild(archBtn);
 
             tab.appendChild(actions);
         }
@@ -101,9 +112,10 @@ function renderChannelTabs() {
     // Update add button disabled state
     const addBtn = document.getElementById('channel-add-btn');
     if (addBtn) {
-        addBtn.classList.toggle('disabled', window.channelList.length >= 8);
+        addBtn.classList.toggle('disabled', window.channelList.length >= _maxActive());
     }
 
+    renderArchivedSection(container);
     renderChannelSidebar();
 }
 
@@ -147,11 +159,11 @@ function renderChannelSidebar() {
             editBtn.onclick = (e) => { e.stopPropagation(); _showSidebarRenameDialog(name); };
             actions.appendChild(editBtn);
 
-            const delBtn = document.createElement('button');
-            delBtn.title = 'Delete';
-            delBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6 4V3h4v1M5 4v8.5h6V4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-            delBtn.onclick = (e) => { e.stopPropagation(); _sidebarConfirmDelete(name, row, label); };
-            actions.appendChild(delBtn);
+            const archBtn = document.createElement('button');
+            archBtn.title = 'Archive (hide, keep history)';
+            archBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M2 4h12v3H2zM3 7v6h10V7M6.5 9.5h3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+            archBtn.onclick = (e) => { e.stopPropagation(); archiveChannel(name); };
+            actions.appendChild(archBtn);
 
             row.appendChild(actions);
         }
@@ -166,9 +178,11 @@ function renderChannelSidebar() {
 
     if (existingCreate) list.appendChild(existingCreate);
 
+    renderArchivedSection(list);
+
     const addBtn = document.getElementById('channel-sidebar-add');
     if (addBtn) {
-        addBtn.classList.toggle('disabled', window.channelList.length >= 8);
+        addBtn.classList.toggle('disabled', window.channelList.length >= _maxActive());
     }
 }
 
@@ -238,52 +252,106 @@ function _showSidebarRenameDialog(oldName) {
     input.select();
 }
 
-function _sidebarConfirmDelete(name, row, label) {
-    if (name === 'general' || row.classList.contains('confirm-delete')) return;
-    const actions = row.querySelector('.channel-sidebar-row-actions');
-    const originalText = label.textContent;
-    const originalOnclick = row.onclick;
+// ---------------------------------------------------------------------------
+// Archive / restore (soft, non-destructive) + permanent purge
+// ---------------------------------------------------------------------------
 
-    row.classList.add('confirm-delete');
-    label.textContent = `delete #${name}?`;
-    if (actions) actions.style.display = 'none';
+// Archive = hide the channel but keep every message in the store. Reversible
+// via restore. No confirm needed because nothing is lost.
+function archiveChannel(name) {
+    if (name === 'general') return;
+    window.ws.send(JSON.stringify({ type: 'channel_archive', name, request_id: _channelReqId() }));
+    if (window.activeChannel === name) switchChannel('general');
+}
 
-    const confirmBar = document.createElement('span');
-    confirmBar.className = 'channel-sidebar-row-actions';
-    confirmBar.style.display = 'flex';
+// Restore a previously archived channel back into the active bar.
+function restoreChannel(name) {
+    if (!name) return;
+    window._setPendingChannelSwitch(name);
+    window.ws.send(JSON.stringify({ type: 'channel_restore', name, request_id: _channelReqId() }));
+}
 
-    const tickBtn = document.createElement('button');
-    tickBtn.title = 'Confirm delete';
-    tickBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M3 8.5l3.5 3.5 6.5-7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+// Destructive: permanently delete a channel AND its message history. Only
+// reachable from the Archived list, behind an explicit two-step confirm.
+function _permanentlyDeleteChannel(name, rowEl) {
+    if (name === 'general' || rowEl.classList.contains('confirm-delete')) return;
+    rowEl.classList.add('confirm-delete');
+    const original = rowEl.innerHTML;
 
-    const crossBtn = document.createElement('button');
-    crossBtn.title = 'Cancel';
-    crossBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
+    const bar = document.createElement('span');
+    bar.className = 'channel-archived-confirm';
+    const warn = document.createElement('span');
+    warn.className = 'channel-archived-warn';
+    warn.textContent = `Delete #${name} + history?`;
+    const yes = document.createElement('button');
+    yes.className = 'ch-confirm-yes';
+    yes.textContent = 'Delete';
+    const no = document.createElement('button');
+    no.className = 'ch-confirm-no';
+    no.textContent = 'Cancel';
+    bar.appendChild(warn);
+    bar.appendChild(yes);
+    bar.appendChild(no);
+    rowEl.innerHTML = '';
+    rowEl.appendChild(bar);
 
-    confirmBar.appendChild(tickBtn);
-    confirmBar.appendChild(crossBtn);
-    row.appendChild(confirmBar);
-
-    const revert = () => {
-        row.classList.remove('confirm-delete');
-        label.textContent = originalText;
-        if (actions) actions.style.display = '';
-        confirmBar.remove();
-        row.onclick = originalOnclick;
-        document.removeEventListener('click', outsideClick);
-    };
-
-    tickBtn.onclick = (e) => {
+    const revert = () => { rowEl.classList.remove('confirm-delete'); rowEl.innerHTML = original; };
+    yes.onclick = (e) => {
         e.stopPropagation();
-        revert();
-        window.ws.send(JSON.stringify({ type: 'channel_delete', name }));
-        if (window.activeChannel === name) switchChannel('general');
+        window.ws.send(JSON.stringify({ type: 'channel_purge', name, request_id: _channelReqId() }));
+        // settings broadcast will drop it from the archived list and re-render.
     };
-    crossBtn.onclick = (e) => { e.stopPropagation(); revert(); };
-    row.onclick = (e) => { e.stopPropagation(); };
+    no.onclick = (e) => { e.stopPropagation(); revert(); };
+}
 
-    const outsideClick = (e) => { if (!row.contains(e.target)) revert(); };
-    setTimeout(() => document.addEventListener('click', outsideClick), 0);
+// ---------------------------------------------------------------------------
+// Archived section — one collapsible disclosure rendered under the active list
+// ---------------------------------------------------------------------------
+
+let _archivedExpanded = false;
+
+function renderArchivedSection(container) {
+    const archived = Array.isArray(window.archivedChannels) ? window.archivedChannels : [];
+    if (!archived.length) return;
+
+    const section = document.createElement('div');
+    section.className = 'channel-archived-section';
+
+    const header = document.createElement('button');
+    header.className = 'channel-archived-header' + (_archivedExpanded ? ' expanded' : '');
+    header.textContent = `${_archivedExpanded ? '▾' : '▸'} Archived (${archived.length})`;
+    header.onclick = (e) => { e.stopPropagation(); _archivedExpanded = !_archivedExpanded; window.renderChannelTabs(); };
+    section.appendChild(header);
+
+    if (_archivedExpanded) {
+        for (const name of archived) {
+            const row = document.createElement('div');
+            row.className = 'channel-archived-row';
+
+            const label = document.createElement('span');
+            label.className = 'channel-archived-label';
+            label.textContent = '# ' + name;
+            row.appendChild(label);
+
+            const restoreBtn = document.createElement('button');
+            restoreBtn.className = 'channel-archived-action';
+            restoreBtn.title = 'Restore';
+            restoreBtn.textContent = 'Restore';
+            restoreBtn.onclick = (e) => { e.stopPropagation(); restoreChannel(name); };
+            row.appendChild(restoreBtn);
+
+            const delBtn = document.createElement('button');
+            delBtn.className = 'channel-archived-action danger';
+            delBtn.title = 'Delete permanently (removes history)';
+            delBtn.textContent = 'Delete';
+            delBtn.onclick = (e) => { e.stopPropagation(); _permanentlyDeleteChannel(name, row); };
+            row.appendChild(delBtn);
+
+            section.appendChild(row);
+        }
+    }
+
+    container.appendChild(section);
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +394,7 @@ function filterMessagesByChannel() {
 // ---------------------------------------------------------------------------
 
 function showChannelCreateDialog() {
-    if (window.channelList.length >= 8) return;
+    if (window.channelList.length >= _maxActive()) return;
     // Route the inline create into the sidebar list when sidebar mode is on,
     // otherwise into the top-bar tabs — keeps the input visible either way.
     const inSidebar = document.body.classList.contains('channels-in-sidebar');
@@ -389,7 +457,7 @@ function _submitInlineCreate(input, wrapper) {
     if (!name || !/^[a-z0-9][a-z0-9\-]{0,19}$/.test(name)) return;
     if (window.channelList.includes(name)) { input.focus(); return; }
     window._setPendingChannelSwitch(name);
-    window.ws.send(JSON.stringify({ type: 'channel_create', name }));
+    window.ws.send(JSON.stringify({ type: 'channel_create', name, request_id: _channelReqId() }));
     wrapper.remove();
 }
 
@@ -465,71 +533,6 @@ function showChannelRenameDialog(oldName) {
         tabs.appendChild(wrapper);
     }
     input.select();
-}
-
-// ---------------------------------------------------------------------------
-// Delete
-// ---------------------------------------------------------------------------
-
-function deleteChannel(name) {
-    if (name === 'general') return;
-    const tab = document.querySelector(`.channel-tab[data-channel="${name}"]`);
-    if (!tab || tab.classList.contains('confirm-delete')) return;
-
-    const label = tab.querySelector('.channel-tab-label');
-    const actions = tab.querySelector('.channel-tab-actions');
-    const originalText = label.textContent;
-    const originalOnclick = tab.onclick;
-
-    tab.classList.add('confirm-delete');
-    tab.classList.remove('editing');
-    label.textContent = `delete #${name}?`;
-    if (actions) actions.style.display = 'none';
-
-    const confirmBar = document.createElement('span');
-    confirmBar.className = 'channel-delete-confirm';
-
-    const tickBtn = document.createElement('button');
-    tickBtn.className = 'ch-confirm-yes';
-    tickBtn.title = 'Confirm delete';
-    tickBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M3 8.5l3.5 3.5 6.5-7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-
-    const crossBtn = document.createElement('button');
-    crossBtn.className = 'ch-confirm-no';
-    crossBtn.title = 'Cancel';
-    crossBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
-
-    confirmBar.appendChild(tickBtn);
-    confirmBar.appendChild(crossBtn);
-    tab.appendChild(confirmBar);
-
-    const revert = () => {
-        tab.classList.remove('confirm-delete');
-        label.textContent = originalText;
-        if (actions) actions.style.display = '';
-        confirmBar.remove();
-        tab.onclick = originalOnclick;
-        document.removeEventListener('click', outsideClick);
-    };
-
-    tickBtn.onclick = (e) => {
-        e.stopPropagation();
-        revert();
-        window.ws.send(JSON.stringify({ type: 'channel_delete', name }));
-        if (window.activeChannel === name) switchChannel('general');
-    };
-
-    crossBtn.onclick = (e) => {
-        e.stopPropagation();
-        revert();
-    };
-
-    tab.onclick = (e) => { e.stopPropagation(); };
-
-    const outsideClick = (e) => {
-        if (!tab.contains(e.target)) revert();
-    };
-    setTimeout(() => document.addEventListener('click', outsideClick), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -676,7 +679,8 @@ window.showChannelCreateDialog = showChannelCreateDialog;
 window.switchChannel = switchChannel;
 window.filterMessagesByChannel = filterMessagesByChannel;
 window.renderChannelTabs = renderChannelTabs;
-window.deleteChannel = deleteChannel;
+window.archiveChannel = archiveChannel;
+window.restoreChannel = restoreChannel;
 window.showChannelRenameDialog = showChannelRenameDialog;
 window.renderChannelSidebar = renderChannelSidebar;
 window.setChannelSidebarMode = setChannelSidebarMode;

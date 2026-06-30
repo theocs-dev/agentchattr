@@ -128,6 +128,13 @@ class MessageStore:
                 msgs = [m for m in msgs if m.get("channel", "general") == channel]
             return list(msgs[-count:])
 
+    def has_channel(self, name: str) -> bool:
+        """True if any stored message belongs to `name`. Used to decide whether
+        an unregistered channel (absent from active/archived lists) is
+        recoverable — i.e. its history would reappear once re-registered."""
+        with self._lock:
+            return any(m.get("channel", "general") == name for m in self._messages)
+
     def get_since(self, since_id: int = 0, channel: str | None = None) -> list[dict]:
         with self._lock:
             msgs = [m for m in self._messages if m["id"] > since_id]

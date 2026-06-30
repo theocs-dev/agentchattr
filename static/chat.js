@@ -515,6 +515,24 @@ function connectWebSocket() {
             updateTyping(event.agent, event.active);
         } else if (event.type === 'settings') {
             applySettings(event.data);
+        } else if (event.type === 'channel_result') {
+            // Per-request ACK from a channel mutation (create/archive/restore/
+            // rename/purge). `settings` remains the source of truth; this only
+            // surfaces negative outcomes so they never fail silently.
+            if (!event.ok) {
+                const reasons = {
+                    full: 'Channel limit reached — archive one to free a slot.',
+                    invalid: 'Invalid channel name.',
+                    archived: `#${event.name} is archived — restore it instead.`,
+                    exists: `#${event.name} already exists.`,
+                    not_found: `#${event.name} not found.`,
+                    general: 'The general channel cannot be changed.',
+                };
+                showToast(reasons[event.reason] || `Channel action failed (${event.reason}).`, 'error');
+                if (pendingChannelSwitch && event.name === pendingChannelSwitch) {
+                    window._setPendingChannelSwitch(null);
+                }
+            }
         } else if (event.type === 'delete') {
             handleDeleteBroadcast(event.ids);
         } else if (event.type === 'rules' || event.type === 'decisions') {
@@ -2087,6 +2105,10 @@ function applySettings(data) {
         selectedAgentFastModes = data.agent_fast_modes;
         buildAgentFastSettings();
     }
+    if (typeof data.max_channels === 'number' && data.max_channels >= 1) {
+        window.maxChannels = data.max_channels;
+    }
+    window.archivedChannels = Array.isArray(data.archived_channels) ? data.archived_channels : [];
     if (data.channels && Array.isArray(data.channels)) {
         channelList = data.channels;
         // If active channel was deleted, switch to general
